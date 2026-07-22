@@ -23,7 +23,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import policy
+from . import policy, signing
 
 HERMES_HOME = Path(os.environ.get('HERMES_HOME', '/opt/data')).resolve()
 CONFIG = HERMES_HOME / 'config.yaml'
@@ -351,7 +351,8 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
                    evidence: str = '', attempts: int = 1, timeout: int = 240,
                    state_path: Path = STATE, runs_dir: Path = RUNS, current_worker=None,
                    runner=run_review, budget_path: Path | None = None,
-                   max_input_tokens: int = 120_000, daily_input_tokens: int = 1_000_000) -> dict:
+                   max_input_tokens: int = 120_000, daily_input_tokens: int = 1_000_000,
+                   signing_key_path: Path | None = None) -> dict:
     frozen = freeze_git_candidate(repo)
     policy.check_privacy(frozen['paths'], frozen['diff'], requirements, evidence)
     result = runner(
@@ -364,6 +365,8 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
     after = freeze_git_candidate(frozen['repo'])
     if after['head'] != frozen['head'] or after['index_tree'] != frozen['index_tree']:
         raise RuntimeError('stale review verdict: Git HEAD or INDEX_TREE changed during review')
+    if signing_key_path is not None:
+        result = signing.sign_result(result, signing_key_path)
     _persist_review_result(runs_dir, result)
     return result
 

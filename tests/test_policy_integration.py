@@ -64,3 +64,27 @@ def test_git_review_privacy_gate_runs_before_remote_runner(tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match='secret-like material'):
         core.run_git_review(tmp_path, 'r', worker(), runner=runner, runs_dir=tmp_path / 'runs')
     assert called is False
+
+
+def test_git_review_signs_before_persisting(tmp_path, monkeypatch):
+    from hermes_code_review import core, signing
+    frozen = {
+        'repo': tmp_path, 'head': 'h', 'index_tree': 't',
+        'diff': b'+safe = True', 'paths': ['app.py'],
+    }
+    monkeypatch.setattr(core, 'freeze_git_candidate', lambda repo: frozen)
+    key = tmp_path / 'receipt.key'; signing.create_signing_key(key)
+    receipt = core.snapshot_receipt_bytes(b'+safe = True', 'h', 't', route_sha='r', reviewer_model='grok-4.5')
+    unsigned = {
+        'receipt': receipt,
+        'verdict': {'passed': True, 'safe_to_commit': True, 'summary': 'clean'},
+        'route': {'name': 'r'},
+        'metrics': {'input_tokens': 1, 'output_tokens': 1, 'elapsed_ms': 1},
+    }
+    result = core.run_git_review(
+        tmp_path, 'r', worker(), runner=lambda *a, **k: unsigned,
+        runs_dir=tmp_path / 'runs', signing_key_path=key,
+    )
+    signing.verify_result(result, key)
+    stored = json.loads(next((tmp_path / 'runs').glob('*.json')).read_text())
+    assert stored['signature'] == result['signature']

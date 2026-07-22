@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
-from . import core
+from . import core, observability, signing
+
+SIGNING_KEY = core.HERMES_HOME / "secrets/code_review_receipt.key"
+METRICS = core.HERMES_HOME / "state/code_review_metrics.jsonl"
 
 REVIEW_SCHEMA = {
     "name": "review_git_candidate",
@@ -38,9 +42,16 @@ def _route() -> tuple[str, dict[str, Any], dict[str, Any]]:
 
 
 def review_git_candidate(args: dict, **_: Any) -> str:
+    started = time.monotonic()
+    worker_name = ""
+    model = ""
+    route_sha = ""
     try:
         name, worker, cfg = _route()
+        worker_name = name
+        model = str(worker.get("model") or "")
         settings = cfg.get("code_review") or {}
+        signing.create_signing_key(SIGNING_KEY)
         result = core.run_git_review(
             Path(str(args["repo"])),
             name,
@@ -53,6 +64,7 @@ def review_git_candidate(args: dict, **_: Any) -> str:
             budget_path=core.BUDGET,
             max_input_tokens=int(settings.get("max_input_tokens") or 120_000),
             daily_input_tokens=int(settings.get("daily_input_tokens") or 1_000_000),
+            signing_key_path=SIGNING_KEY,
         )
         verdict = result["verdict"]
         status = "PASS" if verdict.get("passed") is True and verdict.get("safe_to_commit") is True else "BLOCKED"
@@ -63,8 +75,29 @@ def review_git_candidate(args: dict, **_: Any) -> str:
             "route": result.get("route", {}),
             "metrics": result.get("metrics", {}),
         }
+        route_sha = str((result.get("route") or {}).get("route_sha") or "")
+        metrics = result.get("metrics") or {}
+        try:
+            observability.record_event(
+                METRICS, status=status, worker=worker_name, model=model,
+                route_sha=route_sha,
+                elapsed_ms=int(metrics.get("elapsed_ms") or 0),
+                input_tokens=int(metrics.get("input_tokens") or 0),
+                output_tokens=int(metrics.get("output_tokens") or 0),
+            )
+        except Exception:
+            pass
         return json.dumps(public, ensure_ascii=False, sort_keys=True)
     except Exception as exc:
+        try:
+            observability.record_event(
+                METRICS, status="INFRA_FAILED", worker=worker_name,
+                model=model, route_sha=route_sha,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+                input_tokens=0, output_tokens=0, error=str(exc),
+            )
+        except Exception:
+            pass
         return json.dumps({"status": "INFRA_FAILED", "error": str(exc)}, ensure_ascii=False, sort_keys=True)
 
 

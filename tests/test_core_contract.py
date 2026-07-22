@@ -25,6 +25,7 @@ def test_freeze_binds_head_and_index_tree(tmp_path):
     frozen = core.freeze_git_candidate(tmp_path)
     assert frozen['head'] == subprocess.check_output(['git', '-C', str(tmp_path), 'rev-parse', 'HEAD'], text=True).strip()
     assert frozen['index_tree'] == subprocess.check_output(['git', '-C', str(tmp_path), 'write-tree'], text=True).strip()
+    assert frozen['paths'] == ['code.py']
     assert b'value = 2' in frozen['diff']
 
 

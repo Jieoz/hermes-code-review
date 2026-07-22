@@ -23,14 +23,18 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-CONFIG = Path('/opt/data/config.yaml')
+from . import policy
+
+HERMES_HOME = Path(os.environ.get('HERMES_HOME', '/opt/data')).resolve()
+CONFIG = HERMES_HOME / 'config.yaml'
 CONFIG_KEY = 'delegation.lanes.critic.worker'
 PYTHON = '/opt/data/.venv-tools/bin/python3'
 SWITCHER = '/opt/data/scripts/switch_worker.py'
 CC_ENV = Path('/opt/data/workspace/cc-debug/env.sh')
-STATE = Path('/opt/data/state/review_worker_health.json')
-RUNS = Path('/opt/data/state/review_runs')
-RESERVE_KEY_DIR = Path('/opt/data/secrets/reserve_keys')
+STATE = HERMES_HOME / 'state/review_worker_health.json'
+RUNS = HERMES_HOME / 'state/review_runs'
+BUDGET = HERMES_HOME / 'state/review_budget.json'
+RESERVE_KEY_DIR = HERMES_HOME / 'secrets/reserve_keys'
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -229,7 +233,8 @@ def _persist_review_result(runs_dir: Path, result: dict) -> None:
 def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: str, *,
                requirements: str = '', evidence: str = '', attempts: int = 2, timeout: int = 180,
                state_path: Path = STATE, runs_dir: Path = RUNS, transport=None, sleep=time.sleep,
-               current_worker=None, persist: bool = True) -> dict:
+               current_worker=None, persist: bool = True, budget_path: Path | None = None,
+               max_input_tokens: int = 120_000, daily_input_tokens: int = 1_000_000) -> dict:
     snapshot = worker_snapshot(name, worker)
     route_sha = snapshot['route_sha']; assert_circuit_closed(state_path, route_sha)
     if current_worker is not None and worker_snapshot(name, current_worker())['route_sha'] != route_sha:
@@ -238,28 +243,44 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
         source, head, index_tree, route_sha=route_sha, reviewer_model=snapshot['model']
     )
     prompt = build_review_prompt(source, receipt, requirements=requirements, evidence=evidence)
+    estimated_tokens = policy.assert_request_budget(prompt, max_input_tokens=max_input_tokens)
+    reservation = None
+    if budget_path is not None:
+        reservation = policy.reserve_budget(
+            budget_path, route_sha=route_sha,
+            estimated_input_tokens=estimated_tokens,
+            daily_limit=daily_input_tokens,
+        )
     body = _review_body(snapshot, prompt)
     transport = transport or _request_json
     started = time.monotonic(); payload = None
     attempts = max(1, attempts)
-    for attempt in range(1, attempts + 1):
-        try:
-            payload = transport(snapshot, body, timeout)
-            break
-        except ReviewHTTPError as exc:
-            record_failure(state_path, route_sha)
-            if attempt >= attempts or not retryable_status(exc.status):
-                raise
-            sleep(min(8.0, (2 ** (attempt - 1)) + random.random()))
-        except (urllib.error.URLError, TimeoutError, OSError):
-            record_failure(state_path, route_sha)
-            if attempt >= attempts:
-                raise
-            sleep(min(8.0, (2 ** (attempt - 1)) + random.random()))
-    if payload is None:
-        raise RuntimeError('review transport completed without a response payload')
-    raw, usage = extract_response(payload, snapshot['api_mode'])
-    verdict = parse_strict_verdict(raw, receipt)
+    try:
+        for attempt in range(1, attempts + 1):
+            try:
+                payload = transport(snapshot, body, timeout)
+                break
+            except ReviewHTTPError as exc:
+                record_failure(state_path, route_sha)
+                if attempt >= attempts or not retryable_status(exc.status):
+                    raise
+                sleep(min(8.0, (2 ** (attempt - 1)) + random.random()))
+            except (urllib.error.URLError, TimeoutError, OSError):
+                record_failure(state_path, route_sha)
+                if attempt >= attempts:
+                    raise
+                sleep(min(8.0, (2 ** (attempt - 1)) + random.random()))
+        if payload is None:
+            raise RuntimeError('review transport completed without a response payload')
+        raw, usage = extract_response(payload, snapshot['api_mode'])
+        verdict = parse_strict_verdict(raw, receipt)
+    except Exception:
+        if budget_path is not None and reservation is not None:
+            policy.reconcile_budget(
+                budget_path, reservation,
+                actual_input_tokens=0, actual_output_tokens=0,
+            )
+        raise
     if current_worker is not None:
         after = worker_snapshot(name, current_worker())
         if after['route_sha'] != route_sha:
@@ -267,6 +288,11 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
     record_success(state_path, route_sha)
     input_tokens = usage.get('input_tokens', usage.get('prompt_tokens'))
     output_tokens = usage.get('output_tokens', usage.get('completion_tokens'))
+    if budget_path is not None and reservation is not None:
+        policy.reconcile_budget(
+            budget_path, reservation,
+            actual_input_tokens=int(input_tokens), actual_output_tokens=int(output_tokens),
+        )
     result = {
         'verdict': verdict,
         'receipt': receipt,
@@ -316,18 +342,24 @@ def freeze_git_candidate(repo: Path | str) -> dict:
     diff = _git(repo, 'diff', '--cached', '--binary').stdout
     if not diff:
         raise RuntimeError('staged review candidate is empty')
-    return {'repo': repo, 'head': head, 'index_tree': index_tree, 'diff': diff}
+    names = _git(repo, 'diff', '--cached', '--name-only', '-z').stdout
+    paths = [item.decode(errors='replace') for item in names.split(b'\0') if item]
+    return {'repo': repo, 'head': head, 'index_tree': index_tree, 'diff': diff, 'paths': paths}
 
 
 def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: str = '',
                    evidence: str = '', attempts: int = 1, timeout: int = 240,
                    state_path: Path = STATE, runs_dir: Path = RUNS, current_worker=None,
-                   runner=run_review) -> dict:
+                   runner=run_review, budget_path: Path | None = None,
+                   max_input_tokens: int = 120_000, daily_input_tokens: int = 1_000_000) -> dict:
     frozen = freeze_git_candidate(repo)
+    policy.check_privacy(frozen['paths'], frozen['diff'], requirements, evidence)
     result = runner(
         name, worker, frozen['diff'], frozen['head'], frozen['index_tree'],
         requirements=requirements, evidence=evidence, attempts=attempts, timeout=timeout,
         state_path=state_path, runs_dir=runs_dir, current_worker=current_worker, persist=False,
+        budget_path=budget_path, max_input_tokens=max_input_tokens,
+        daily_input_tokens=daily_input_tokens,
     )
     after = freeze_git_candidate(frozen['repo'])
     if after['head'] != frozen['head'] or after['index_tree'] != frozen['index_tree']:

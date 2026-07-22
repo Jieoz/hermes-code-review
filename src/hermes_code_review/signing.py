@@ -52,10 +52,11 @@ def sign_result(result: dict, key_path: Path) -> dict:
     return signed
 
 
-def verify_result(result: dict, key_path: Path) -> None:
+def verify_result(result: dict, key_path: Path) -> bool:
     signature = result.get('signature') if isinstance(result, dict) else None
     if not isinstance(signature, dict) or signature.get('algorithm') != 'hmac-sha256':
         raise ValueError('review signature missing or unsupported')
     expected = hmac.new(_read_key(key_path), _payload(result), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(str(signature.get('digest') or ''), expected):
         raise ValueError('review signature verification failed')
+    return True

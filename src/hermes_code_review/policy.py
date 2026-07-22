@@ -4,9 +4,11 @@ import fcntl
 import json
 import os
 import re
+import stat
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 
@@ -53,6 +55,16 @@ def check_privacy(paths: list[str], diff: bytes, requirements: str, evidence: st
         raise PolicyViolation('secret-like material detected; external review payload blocked')
 
 
+def assert_public_payload_safe(value: object, *, forbidden: list[str]) -> None:
+    """Fail closed if a public result contains known credentials or secret syntax."""
+    material = json.dumps(value, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    for secret in forbidden:
+        if secret and secret.encode('utf-8') in material:
+            raise PolicyViolation('credential material detected in public review result')
+    if any(pattern.search(material) for pattern in _SECRET_PATTERNS):
+        raise PolicyViolation('secret-like material detected in public review result')
+
+
 def estimate_tokens(text: str | bytes) -> int:
     size = len(text.encode('utf-8') if isinstance(text, str) else text)
     return (size + 3) // 4
@@ -79,11 +91,49 @@ def _atomic_json(path: Path, value: dict) -> None:
         temp.unlink(missing_ok=True)
 
 
+@contextmanager
+def exclusive_lock(path: Path):
+    """Open an owned regular lock file without following symlinks."""
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise PolicyViolation('unsafe policy lock file') from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise PolicyViolation('unsafe policy lock file')
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'a') as handle:
+            fd = -1
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield handle
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _load(path: Path, day: str) -> dict:
     try:
-        value = json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0))
+    except FileNotFoundError:
         value = {}
+    except OSError as exc:
+        raise PolicyViolation('unsafe budget ledger') from exc
+    else:
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise PolicyViolation('unsafe budget ledger')
+            data = os.read(fd, 1_048_577)
+            if len(data) > 1_048_576:
+                raise PolicyViolation('budget ledger is unexpectedly large')
+            try:
+                value = json.loads(data.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                value = {}
+        finally:
+            os.close(fd)
     if value.get('day') != day:
         return {'day': day, 'routes': {}, 'reservations': {}}
     value.setdefault('routes', {})
@@ -96,27 +146,33 @@ def _day(now: float) -> str:
 
 
 def reserve_budget(path: Path, *, route_sha: str, estimated_input_tokens: int,
-                   daily_limit: int, now: float | None = None) -> str:
+                   estimated_output_tokens: int, daily_input_limit: int,
+                   daily_output_limit: int, now: float | None = None) -> str:
     now = time.time() if now is None else now
-    if estimated_input_tokens <= 0 or daily_limit <= 0:
+    if min(estimated_input_tokens, estimated_output_tokens, daily_input_limit, daily_output_limit) <= 0:
         raise PolicyViolation('review budget limits must be positive')
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f'.{path.name}.lock')
-    with lock_path.open('a') as lock:
+    with exclusive_lock(lock_path) as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         value = _load(path, _day(now))
         row = dict(value['routes'].get(route_sha) or {})
-        used = int(row.get('input_tokens') or 0) + int(row.get('reserved_input_tokens') or 0)
-        if used + estimated_input_tokens > daily_limit:
-            raise PolicyViolation('daily review budget exhausted')
+        used_input = int(row.get('input_tokens') or 0) + int(row.get('reserved_input_tokens') or 0)
+        used_output = int(row.get('output_tokens') or 0) + int(row.get('reserved_output_tokens') or 0)
+        if used_input + estimated_input_tokens > daily_input_limit:
+            raise PolicyViolation('daily review input budget exhausted')
+        if used_output + estimated_output_tokens > daily_output_limit:
+            raise PolicyViolation('daily review output budget exhausted')
         reservation = uuid.uuid4().hex
         row['reserved_input_tokens'] = int(row.get('reserved_input_tokens') or 0) + estimated_input_tokens
+        row['reserved_output_tokens'] = int(row.get('reserved_output_tokens') or 0) + estimated_output_tokens
         row.setdefault('input_tokens', 0)
         row.setdefault('output_tokens', 0)
         value['routes'][route_sha] = row
         value['reservations'][reservation] = {
             'route_sha': route_sha,
             'estimated_input_tokens': estimated_input_tokens,
+            'estimated_output_tokens': estimated_output_tokens,
             'created_at': now,
         }
         _atomic_json(path, value)
@@ -128,16 +184,18 @@ def reconcile_budget(path: Path, reservation: str, *, actual_input_tokens: int,
     now = time.time() if now is None else now
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f'.{path.name}.lock')
-    with lock_path.open('a') as lock:
+    with exclusive_lock(lock_path) as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         value = _load(path, _day(now))
         reserved = value['reservations'].pop(reservation, None)
         if not reserved:
             raise PolicyViolation('unknown or expired budget reservation')
         route_sha = reserved['route_sha']
-        estimated = int(reserved['estimated_input_tokens'])
+        estimated_input = int(reserved['estimated_input_tokens'])
+        estimated_output = int(reserved['estimated_output_tokens'])
         row = dict(value['routes'].get(route_sha) or {})
-        row['reserved_input_tokens'] = max(0, int(row.get('reserved_input_tokens') or 0) - estimated)
+        row['reserved_input_tokens'] = max(0, int(row.get('reserved_input_tokens') or 0) - estimated_input)
+        row['reserved_output_tokens'] = max(0, int(row.get('reserved_output_tokens') or 0) - estimated_output)
         row['input_tokens'] = int(row.get('input_tokens') or 0) + int(actual_input_tokens)
         row['output_tokens'] = int(row.get('output_tokens') or 0) + int(actual_output_tokens)
         value['routes'][route_sha] = row

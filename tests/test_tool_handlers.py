@@ -16,18 +16,18 @@ def test_review_tool_returns_machine_pass(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin, 'SIGNING_KEY', tmp_path / 'receipt.key')
     monkeypatch.setattr(plugin, 'METRICS', tmp_path / 'metrics.jsonl')
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
-        'delegation': {'lanes': {'critic': {'worker': 'review'}}},
-        'main_token_reserve': {'workers': {'review': configured_worker()}},
+        'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
+        'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
     })
     seen = {}
     def fake_run(*args, **kwargs):
         seen.update(kwargs)
-        return {
+        return plugin.signing.sign_result({
             'verdict': {'passed': True, 'safe_to_commit': True, 'summary': 'clean'},
             'receipt': {'reviewer_model': 'grok-4.5', 'review_head': 'h', 'review_index_tree': 't'},
             'route': {'route_sha': 'route'},
             'metrics': {'input_tokens': 10, 'output_tokens': 5, 'elapsed_ms': 7},
-        }
+        }, plugin.SIGNING_KEY)
     monkeypatch.setattr(plugin.core, 'run_git_review', fake_run)
     value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path), 'requirements': 'r', 'evidence': 'e'}))
     assert value['status'] == 'PASS'
@@ -44,21 +44,64 @@ def test_review_tool_fails_closed_on_any_exception(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin, 'SIGNING_KEY', tmp_path / 'receipt.key', raising=False)
     monkeypatch.setattr(plugin, 'METRICS', tmp_path / 'metrics.jsonl', raising=False)
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
-        'delegation': {'lanes': {'critic': {'worker': 'review'}}},
-        'main_token_reserve': {'workers': {'review': configured_worker()}},
+        'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
+        'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
     })
     monkeypatch.setattr(plugin.core, 'run_git_review', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('HTTP 504')))
     value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
-    assert value == {'status': 'INFRA_FAILED', 'error': 'HTTP 504'}
+    assert value == {'status': 'INFRA_FAILED', 'error_class': 'HTTP_5XX'}
+
+
+def test_review_tool_fails_closed_when_metrics_sink_fails(monkeypatch, tmp_path):
+    from hermes_code_review import plugin
+    monkeypatch.setattr(plugin, 'SIGNING_KEY', tmp_path / 'receipt.key')
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
+        'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
+    })
+    result = {
+        'verdict': {'passed': True, 'safe_to_commit': True, 'summary': 'clean'},
+        'receipt': {'reviewer_model': 'grok-4.5'},
+        'route': {'name': 'hybgzs_grok45', 'model': 'grok-4.5', 'api_mode': 'chat_completions', 'route_sha': 'route'},
+        'metrics': {'input_tokens': 10, 'output_tokens': 5, 'elapsed_ms': 7},
+    }
+    monkeypatch.setattr(plugin.core, 'run_git_review', lambda *a, **k: plugin.signing.sign_result(result, plugin.SIGNING_KEY))
+    monkeypatch.setattr(plugin.observability, 'record_event', lambda *a, **k: (_ for _ in ()).throw(OSError('sink down')))
+    value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
+    assert value['status'] == 'INFRA_FAILED'
+
+
+def test_public_result_is_whitelisted_and_rejects_known_credential(monkeypatch, tmp_path):
+    from hermes_code_review import plugin
+    monkeypatch.setattr(plugin, 'SIGNING_KEY', tmp_path / 'receipt.key')
+    monkeypatch.setattr(plugin, 'METRICS', tmp_path / 'metrics.jsonl')
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
+        'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
+    })
+    result = {
+        'verdict': {'passed': True, 'safe_to_commit': True, 'summary': 'clean'},
+        'receipt': {'reviewer_model': 'grok-4.5'},
+        'route': {'name': 'hybgzs_grok45', 'model': 'grok-4.5', 'api_mode': 'chat_completions', 'route_sha': 'route', 'endpoint': 'https://private.invalid'},
+        'metrics': {'input_tokens': 1, 'output_tokens': 1, 'elapsed_ms': 1, 'debug': 'must-not-escape'},
+    }
+    monkeypatch.setattr(plugin.core, 'run_git_review', lambda *a, **k: plugin.signing.sign_result(result, plugin.SIGNING_KEY))
+    value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
+    text = json.dumps(value)
+    assert value['status'] == 'PASS' and len(value['signature']['digest']) == 64
+    assert 'private.invalid' not in text and 'must-not-escape' not in text
+    result['verdict']['summary'] = configured_worker()['api_key']
+    value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
+    assert value['status'] == 'INFRA_FAILED'
 
 
 def test_status_tool_is_non_secret(monkeypatch):
     from hermes_code_review import plugin
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
-        'delegation': {'lanes': {'critic': {'worker': 'review'}}},
-        'main_token_reserve': {'workers': {'review': configured_worker()}},
+        'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
+        'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
     })
     value = json.loads(plugin.code_review_status({}))
     assert value['status'] == 'READY'
-    assert value['worker'] == 'review' and value['model'] == 'grok-4.5'
+    assert value['worker'] == 'hybgzs_grok45' and value['model'] == 'grok-4.5'
     assert 'secret' not in json.dumps(value)

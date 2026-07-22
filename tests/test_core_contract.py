@@ -44,8 +44,8 @@ def test_freeze_rejects_tracked_unstaged_and_untracked(tmp_path):
 def test_route_fingerprint_excludes_credentials():
     from hermes_code_review import core
     base = {'provider': 'custom', 'base_url': 'https://review.example/v1', 'model': 'grok-4.5', 'api_mode': 'chat_completions', 'enabled': True}
-    a = core.worker_snapshot('r', {**base, 'api_key': 'secret-one'})
-    b = core.worker_snapshot('r', {**base, 'api_key': 'secret-two'})
+    a = core.worker_snapshot(core.APPROVED_WORKER, {**base, 'api_key': 'secret-one'})
+    b = core.worker_snapshot(core.APPROVED_WORKER, {**base, 'api_key': 'secret-two'})
     assert a['route_sha'] == b['route_sha']
     assert 'secret' not in a['route_sha']
 
@@ -55,10 +55,19 @@ def test_keyfile_must_be_0600_and_under_allowed_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(core, 'RESERVE_KEY_DIR', tmp_path)
     path = tmp_path / 'key'; path.write_text('secret\n'); path.chmod(0o600)
     worker = {'provider': 'custom', 'base_url': 'https://review.example/v1', 'model': 'grok-4.5', 'api_mode': 'chat_completions', 'enabled': True, 'api_key_file': str(path)}
-    assert core.worker_snapshot('r', worker)['credential'] == 'secret'
+    assert core.worker_snapshot(core.APPROVED_WORKER, worker)['credential'] == 'secret'
     path.chmod(0o644)
     with pytest.raises(ValueError, match='permissions'):
-        core.worker_snapshot('r', worker)
+        core.worker_snapshot(core.APPROVED_WORKER, worker)
+    path.chmod(0o600)
+    link = tmp_path / 'link'
+    link.symlink_to(path)
+    with pytest.raises(ValueError, match='regular file'):
+        core.worker_snapshot(core.APPROVED_WORKER, {**worker, 'api_key_file': str(link)})
+    nested = tmp_path / 'nested'; nested.mkdir()
+    nested_key = nested / 'key'; nested_key.write_text('secret'); nested_key.chmod(0o600)
+    with pytest.raises(ValueError, match='direct child'):
+        core.worker_snapshot(core.APPROVED_WORKER, {**worker, 'api_key_file': str(nested_key)})
 
 
 def test_strict_verdict_requires_evidence_and_identity():
@@ -69,6 +78,16 @@ def test_strict_verdict_requires_evidence_and_identity():
     value['p1'] = ['vague']
     with pytest.raises(ValueError, match='file/line/issue'):
         core.validate_verdict(value, receipt)
+    valid = {'passed': True, **receipt, 'p0': [], 'p1': [], 'p2': [], 'needs_evidence': [], 'security_concerns': [], 'safe_to_commit': True, 'summary': 'clean'}
+    wrong_identity = {**valid, 'review_head': 'other'}
+    with pytest.raises(ValueError, match='stale'):
+        core.validate_verdict(wrong_identity, receipt)
+    inconsistent = {**valid, 'safe_to_commit': False}
+    with pytest.raises(ValueError, match='inconsistent'):
+        core.validate_verdict(inconsistent, receipt)
+    missing = dict(valid); missing.pop('review_route_sha')
+    with pytest.raises(ValueError, match='schema'):
+        core.validate_verdict(missing, receipt)
 
 
 def test_circuit_failure_updates_are_atomic(tmp_path):

@@ -31,3 +31,6 @@ jobs:
           python -m build
           tar -tf dist/*.tar.gz | grep -q 'plugin.yaml'
           tar -tf dist/*.tar.gz | grep -q 'corpus/known_defects.json'
+          python -m pip install --force-reinstall dist/*.whl
+          python -c 'import hermes_code_review; from hermes_code_review.plugin import register; assert callable(register)'
+          hermes-code-review --help

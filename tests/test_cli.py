@@ -4,11 +4,24 @@ import json
 
 
 def test_cli_review_exit_codes(monkeypatch, capsys, tmp_path):
-    from hermes_code_review import cli
-    monkeypatch.setattr(cli.plugin, "review_git_candidate", lambda args: json.dumps({"status": "PASS", "safe_to_commit": True}))
+    from hermes_code_review import cli, signing
+    key = tmp_path / "receipt.key"
+    signing.create_signing_key(key)
+    monkeypatch.setattr(cli.plugin, "SIGNING_KEY", key)
+    def response(status, safe):
+        value = signing.sign_result({
+            "receipt": {"review_head": "h"},
+            "verdict": {"passed": status == "PASS", "safe_to_commit": safe},
+            "metrics": {"input_tokens": 1, "output_tokens": 1},
+        }, key)
+        value["status"] = status
+        return json.dumps(value)
+    monkeypatch.setattr(cli.plugin, "review_git_candidate", lambda args: response("PASS", True))
     assert cli.main(["review-git", "--repo", str(tmp_path), "--requirements", "r", "--evidence", "e"]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "PASS"
-    monkeypatch.setattr(cli.plugin, "review_git_candidate", lambda args: json.dumps({"status": "BLOCKED", "safe_to_commit": False}))
+    monkeypatch.setattr(cli.plugin, "review_git_candidate", lambda args: response("PASS", False))
+    assert cli.main(["review-git", "--repo", str(tmp_path), "--requirements", "r", "--evidence", "e"]) == 3
+    monkeypatch.setattr(cli.plugin, "review_git_candidate", lambda args: response("BLOCKED", False))
     assert cli.main(["review-git", "--repo", str(tmp_path), "--requirements", "r", "--evidence", "e"]) == 2
 
 
@@ -21,6 +34,10 @@ def test_cli_verifies_signed_receipt(capsys, tmp_path):
     result_file.write_text(json.dumps(result))
     assert cli.main(["verify-receipt", str(result_file), "--key-file", str(key)]) == 0
     assert json.loads(capsys.readouterr().out)["valid"] is True
+    result["verdict"]["passed"] = False
+    result_file.write_text(json.dumps(result))
+    assert cli.main(["verify-receipt", str(result_file), "--key-file", str(key)]) == 4
+    assert json.loads(capsys.readouterr().out)["valid"] is False
 
 
 def test_cli_rejects_infra_result(monkeypatch, tmp_path):

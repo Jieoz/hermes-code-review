@@ -31,7 +31,7 @@ def test_run_review_reserves_and_reconciles_budget(tmp_path):
         }
         return valid_payload(receipt)
 
-    result = core.run_review('r', worker(), b'diff', 'h', 't', transport=transport,
+    result = core.run_review(core.APPROVED_WORKER, worker(), b'diff', 'h', 't', transport=transport,
                              state_path=tmp_path / 'health.json', runs_dir=tmp_path / 'runs',
                              budget_path=ledger, max_input_tokens=5000, daily_input_tokens=5000)
     assert result['verdict']['passed'] is True
@@ -46,7 +46,7 @@ def test_run_review_rejects_over_cap_before_transport(tmp_path):
     def transport(*args):
         nonlocal called; called = True
     with pytest.raises(RuntimeError, match='request token estimate'):
-        core.run_review('r', worker(), b'x' * 1000, 'h', 't', transport=transport,
+        core.run_review(core.APPROVED_WORKER, worker(), b'x' * 1000, 'h', 't', transport=transport,
                         state_path=tmp_path / 'health.json', runs_dir=tmp_path / 'runs',
                         budget_path=tmp_path / 'budget.json', max_input_tokens=10, daily_input_tokens=5000)
     assert called is False
@@ -62,7 +62,7 @@ def test_git_review_privacy_gate_runs_before_remote_runner(tmp_path, monkeypatch
     def runner(*args, **kwargs):
         nonlocal called; called = True
     with pytest.raises(RuntimeError, match='secret-like material'):
-        core.run_git_review(tmp_path, 'r', worker(), runner=runner, runs_dir=tmp_path / 'runs')
+        core.run_git_review(tmp_path, core.APPROVED_WORKER, worker(), runner=runner, runs_dir=tmp_path / 'runs')
     assert called is False
 
 

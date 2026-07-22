@@ -18,7 +18,7 @@ def worker():
 
 
 def result_for(core, source, passed):
-    snap = core.worker_snapshot('r', worker())
+    snap = core.worker_snapshot(core.APPROVED_WORKER, worker())
     receipt = core.snapshot_receipt_bytes(source, 'h', 't', route_sha=snap['route_sha'], reviewer_model=snap['model'])
     finding = [] if passed else [{'file': 'b.py', 'line': 1, 'issue': 'wrong branch'}]
     verdict = {
@@ -38,10 +38,58 @@ def test_staged_diff_is_split_only_at_file_boundaries(tmp_path):
         (tmp_path / name).write_text('x = ' + repr(name * 30) + '\n')
     subprocess.run(['git', '-C', str(tmp_path), 'add', 'a.py', 'b.py', 'c.py'], check=True)
     frozen = core.freeze_git_candidate(tmp_path)
-    chunks = core.chunk_staged_diff(tmp_path, frozen['paths'], max_source_bytes=350)
+    chunks = core.chunk_staged_diff(
+        tmp_path, frozen['paths'], head=frozen['head'],
+        index_tree=frozen['index_tree'], max_source_bytes=350,
+    )
     assert len(chunks) >= 2
     assert all(len(chunk['diff']) <= 350 for chunk in chunks)
     assert sorted(path for chunk in chunks for path in chunk['paths']) == ['a.py', 'b.py', 'c.py']
+
+
+def test_chunking_reads_the_frozen_tree_not_a_mutated_live_index(tmp_path):
+    from hermes_code_review import core
+    init_repo(tmp_path)
+    (tmp_path / 'a.py').write_text('frozen = True\n')
+    subprocess.run(['git', '-C', str(tmp_path), 'add', 'a.py'], check=True)
+    frozen = core.freeze_git_candidate(tmp_path)
+    (tmp_path / 'a.py').write_text('mutated = True\n')
+    subprocess.run(['git', '-C', str(tmp_path), 'add', 'a.py'], check=True)
+    chunks = core.chunk_staged_diff(
+        tmp_path, frozen['paths'], head=frozen['head'],
+        index_tree=frozen['index_tree'], max_source_bytes=1000,
+    )
+    assert b'frozen = True' in chunks[0]['diff']
+    assert b'mutated = True' not in chunks[0]['diff']
+
+
+def test_single_file_larger_than_chunk_cap_fails_closed(tmp_path):
+    import pytest
+    from hermes_code_review import core
+    init_repo(tmp_path)
+    (tmp_path / 'large.py').write_text('x = ' + repr('a' * 1000) + '\n')
+    subprocess.run(['git', '-C', str(tmp_path), 'add', 'large.py'], check=True)
+    frozen = core.freeze_git_candidate(tmp_path)
+    with pytest.raises(RuntimeError, match='single-file staged diff exceeds'):
+        core.chunk_staged_diff(
+            tmp_path, frozen['paths'], head=frozen['head'],
+            index_tree=frozen['index_tree'], max_source_bytes=100,
+        )
+
+
+def test_review_rejects_index_change_after_remote_verdict(tmp_path):
+    import pytest
+    from hermes_code_review import core
+    init_repo(tmp_path)
+    (tmp_path / 'a.py').write_text('value = 1\n')
+    subprocess.run(['git', '-C', str(tmp_path), 'add', 'a.py'], check=True)
+    def runner(name, worker_value, source, head, index_tree, **kwargs):
+        (tmp_path / 'a.py').write_text('value = 2\n')
+        subprocess.run(['git', '-C', str(tmp_path), 'add', 'a.py'], check=True)
+        return result_for(core, source, passed=True)
+    with pytest.raises(RuntimeError, match='stale'):
+        core.run_git_review(tmp_path, core.APPROVED_WORKER, worker(), runner=runner,
+                            runs_dir=tmp_path / 'runs')
 
 
 def test_segmented_review_aggregates_blockers_and_full_identity(tmp_path, monkeypatch):
@@ -49,14 +97,15 @@ def test_segmented_review_aggregates_blockers_and_full_identity(tmp_path, monkey
     full = b'full staged diff larger than cap'
     frozen = {'repo': tmp_path, 'head': 'h', 'index_tree': 't', 'diff': full, 'paths': ['a.py', 'b.py']}
     monkeypatch.setattr(core, 'freeze_git_candidate', lambda repo: frozen)
-    monkeypatch.setattr(core, 'chunk_staged_diff', lambda repo, paths, max_source_bytes: [
+    monkeypatch.setattr(core, 'chunk_staged_diff', lambda repo, paths, head, index_tree, max_source_bytes: [
         {'paths': ['a.py'], 'diff': b'chunk-a'}, {'paths': ['b.py'], 'diff': b'chunk-b'},
     ])
+    monkeypatch.setattr(core, 'validate_finding_references', lambda repo, verdict, index_tree: None)
     calls = []
     def runner(name, worker_value, source, head, index_tree, **kwargs):
         calls.append(source)
         return result_for(core, source, passed=source == b'chunk-a')
-    result = core.run_git_review(tmp_path, 'r', worker(), runner=runner,
+    result = core.run_git_review(tmp_path, core.APPROVED_WORKER, worker(), runner=runner,
                                  runs_dir=tmp_path / 'runs', max_source_bytes=5)
     assert calls == [b'chunk-a', b'chunk-b']
     assert result['verdict']['passed'] is False

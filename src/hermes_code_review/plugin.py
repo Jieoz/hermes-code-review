@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import core, observability, signing
+from . import core, observability, policy, signing
 
 SIGNING_KEY = core.HERMES_HOME / "secrets/code_review_receipt.key"
 METRICS = core.HERMES_HOME / "state/code_review_metrics.jsonl"
@@ -31,14 +31,45 @@ STATUS_SCHEMA = {
 }
 
 
-def _route() -> tuple[str, dict[str, Any], dict[str, Any]]:
+def _route() -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any]]:
     cfg = core.load_config()
     name = core.selected_name(cfg)
     workers = (cfg.get("main_token_reserve") or {}).get("workers") or {}
     worker = workers.get(name)
-    if not name or not isinstance(worker, dict):
+    if name != core.APPROVED_WORKER or not isinstance(worker, dict):
         raise RuntimeError("fixed code-review worker is not configured")
-    return name, worker, cfg
+    snapshot = core.worker_snapshot(name, worker)
+    return name, worker, cfg, snapshot
+
+
+def _error_class(exc: Exception) -> str:
+    classified = observability.classify_error(str(exc))
+    if classified != "OTHER":
+        return classified
+    return type(exc).__name__.replace("Error", "_ERROR").upper()
+
+
+def _public_result(result: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    receipt_keys = (
+        "review_head", "review_index_tree", "review_diff_sha",
+        "review_route_sha", "reviewer_model",
+    )
+    metric_keys = ("attempts", "elapsed_ms", "input_tokens", "output_tokens", "chunk_count")
+    receipt = result.get("receipt") or {}
+    metrics = result.get("metrics") or {}
+    signature = result.get("signature") or {}
+    public = {
+        "verdict": result.get("verdict"),
+        "receipt": {key: receipt[key] for key in receipt_keys if key in receipt},
+        "route": core.public_route(snapshot),
+        "metrics": {key: int(metrics[key]) for key in metric_keys if key in metrics},
+        "signature": {
+            "algorithm": signature.get("algorithm"),
+            "digest": signature.get("digest"),
+        },
+    }
+    policy.assert_public_payload_safe(public, forbidden=[str(snapshot.get("credential") or "")])
+    return public
 
 
 def review_git_candidate(args: dict, **_: Any) -> str:
@@ -47,7 +78,7 @@ def review_git_candidate(args: dict, **_: Any) -> str:
     model = ""
     route_sha = ""
     try:
-        name, worker, cfg = _route()
+        name, worker, cfg, snapshot = _route()
         worker_name = name
         model = str(worker.get("model") or "")
         settings = cfg.get("code_review") or {}
@@ -59,35 +90,30 @@ def review_git_candidate(args: dict, **_: Any) -> str:
             requirements=str(args.get("requirements") or ""),
             evidence=str(args.get("evidence") or ""),
             attempts=1,
-            timeout=240,
+            timeout=max(1, min(int(args.get("timeout") or 240), 600)),
             current_worker=lambda: _route()[1],
             budget_path=core.BUDGET,
             max_input_tokens=int(settings.get("max_input_tokens") or 120_000),
             daily_input_tokens=int(settings.get("daily_input_tokens") or 1_000_000),
+            max_output_tokens=int(settings.get("max_output_tokens") or 4_096),
+            daily_output_tokens=int(settings.get("daily_output_tokens") or 100_000),
             signing_key_path=SIGNING_KEY,
             max_source_bytes=int(settings.get("max_source_bytes") or 350_000),
         )
-        verdict = result["verdict"]
+        signing.verify_result(result, SIGNING_KEY)
+        public = _public_result(result, snapshot)
+        verdict = public["verdict"]
         status = "PASS" if verdict.get("passed") is True and verdict.get("safe_to_commit") is True else "BLOCKED"
-        public = {
-            "status": status,
-            "verdict": verdict,
-            "receipt": result["receipt"],
-            "route": result.get("route", {}),
-            "metrics": result.get("metrics", {}),
-        }
+        public["status"] = status
         route_sha = str((result.get("route") or {}).get("route_sha") or "")
         metrics = result.get("metrics") or {}
-        try:
-            observability.record_event(
-                METRICS, status=status, worker=worker_name, model=model,
-                route_sha=route_sha,
-                elapsed_ms=int(metrics.get("elapsed_ms") or 0),
-                input_tokens=int(metrics.get("input_tokens") or 0),
-                output_tokens=int(metrics.get("output_tokens") or 0),
-            )
-        except Exception:
-            pass
+        observability.record_event(
+            METRICS, status=status, worker=worker_name, model=model,
+            route_sha=route_sha,
+            elapsed_ms=int(metrics.get("elapsed_ms") or 0),
+            input_tokens=int(metrics.get("input_tokens") or 0),
+            output_tokens=int(metrics.get("output_tokens") or 0),
+        )
         return json.dumps(public, ensure_ascii=False, sort_keys=True)
     except Exception as exc:
         try:
@@ -99,14 +125,13 @@ def review_git_candidate(args: dict, **_: Any) -> str:
             )
         except Exception:
             pass
-        return json.dumps({"status": "INFRA_FAILED", "error": str(exc)}, ensure_ascii=False, sort_keys=True)
+        return json.dumps({"status": "INFRA_FAILED", "error_class": _error_class(exc)}, ensure_ascii=False, sort_keys=True)
 
 
 def code_review_status(args: dict, **_: Any) -> str:
     del args
     try:
-        name, worker, _cfg = _route()
-        snapshot = core.worker_snapshot(name, worker)
+        name, _worker, _cfg, snapshot = _route()
         return json.dumps({
             "status": "READY",
             "worker": name,
@@ -116,7 +141,7 @@ def code_review_status(args: dict, **_: Any) -> str:
             "fallback": "fail",
         }, ensure_ascii=False, sort_keys=True)
     except Exception as exc:
-        return json.dumps({"status": "INFRA_FAILED", "error": str(exc)}, ensure_ascii=False, sort_keys=True)
+        return json.dumps({"status": "INFRA_FAILED", "error_class": _error_class(exc)}, ensure_ascii=False, sort_keys=True)
 
 
 def register(ctx) -> None:

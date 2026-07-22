@@ -27,15 +27,23 @@ def create_signing_key(path: Path) -> None:
 
 
 def _read_key(path: Path) -> bytes:
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise ValueError('receipt signing key must be a regular file')
-    if info.st_mode & 0o077:
-        raise ValueError('receipt signing key permissions must be 0600')
-    key = path.read_bytes()
-    if len(key) < 32:
-        raise ValueError('receipt signing key must contain at least 32 bytes')
-    return key
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError('receipt signing key must be a readable regular file') from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise ValueError('receipt signing key must be an owned regular file')
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError('receipt signing key permissions must be 0600')
+        key = os.read(fd, 4_097)
+        if len(key) < 32 or len(key) > 4_096:
+            raise ValueError('receipt signing key must contain 32 to 4096 bytes')
+        return key
+    finally:
+        os.close(fd)
 
 
 def _payload(result: dict) -> bytes:

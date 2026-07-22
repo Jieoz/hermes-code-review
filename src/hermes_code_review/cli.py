@@ -35,16 +35,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             "evidence": args.evidence,
             "timeout": args.timeout,
         }))
-        print(json.dumps(result, sort_keys=True))
         status = result.get("status")
-        if status == "PASS" and result.get("safe_to_commit") is True:
+        signature_valid = False
+        if status == "PASS":
+            try:
+                signature_valid = signing.verify_result(result, plugin.SIGNING_KEY)
+            except (ValueError, OSError):
+                signature_valid = False
+        print(json.dumps(result, sort_keys=True))
+        if status == "PASS" and signature_valid and (result.get("verdict") or {}).get("safe_to_commit") is True:
             return 0
         if status == "BLOCKED":
             return 2
         return 3
     if args.command == "verify-receipt":
         result = json.loads(Path(args.result).read_text(encoding="utf-8"))
-        valid = signing.verify_result(result, Path(args.key_file))
+        try:
+            valid = signing.verify_result(result, Path(args.key_file))
+        except (ValueError, OSError):
+            valid = False
         print(json.dumps({"valid": valid}))
         return 0 if valid else 4
     result = json.loads(plugin.code_review_status({}))

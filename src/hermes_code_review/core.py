@@ -7,15 +7,15 @@ explicit fail-closed route for review/audit tasks.
 """
 from __future__ import annotations
 
-import argparse
 import fcntl
 import hashlib
 import json
 import os
 import random
+import stat
 import ssl
 import subprocess
-import sys
+
 import tempfile
 import time
 import urllib.error
@@ -27,14 +27,14 @@ from . import policy, signing
 
 HERMES_HOME = Path(os.environ.get('HERMES_HOME', '/opt/data')).resolve()
 CONFIG = HERMES_HOME / 'config.yaml'
-CONFIG_KEY = 'delegation.lanes.critic.worker'
-PYTHON = '/opt/data/.venv-tools/bin/python3'
-SWITCHER = '/opt/data/scripts/switch_worker.py'
-CC_ENV = Path('/opt/data/workspace/cc-debug/env.sh')
 STATE = HERMES_HOME / 'state/review_worker_health.json'
 RUNS = HERMES_HOME / 'state/review_runs'
 BUDGET = HERMES_HOME / 'state/review_budget.json'
 RESERVE_KEY_DIR = HERMES_HOME / 'secrets/reserve_keys'
+APPROVED_WORKER = 'hybgzs_grok45'
+APPROVED_MODEL = 'grok-4.5'
+APPROVED_API_MODE = 'chat_completions'
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -64,21 +64,49 @@ def resolve_worker_credential(worker: dict) -> str:
     if not key_file:
         return ''
     allowed = RESERVE_KEY_DIR.resolve()
-    path = Path(key_file).resolve()
-    if not path.is_relative_to(allowed) or not path.is_file():
-        raise ValueError('review worker api_key_file is outside the allowed secret directory or missing')
-    if path.stat().st_mode & 0o077:
-        raise ValueError('review worker api_key_file permissions must be 0600')
-    return path.read_text(encoding='utf-8').strip()
+    requested = Path(key_file)
+    if not requested.is_absolute() or requested.parent.resolve() != allowed:
+        raise ValueError('review worker api_key_file must be a direct child of the allowed secret directory')
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NOFOLLOW', 0)
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_DIRECTORY', 0)
+    directory_fd = os.open(allowed, directory_flags)
+    try:
+        fd = os.open(requested.name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise ValueError('review worker api_key_file must be a readable regular file') from exc
+    finally:
+        os.close(directory_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('review worker api_key_file must be a regular file')
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError('review worker api_key_file permissions must be 0600')
+        if info.st_uid != os.geteuid():
+            raise ValueError('review worker api_key_file must be owned by the gateway user')
+        value = os.read(fd, 16_385)
+        if len(value) > 16_384:
+            raise ValueError('review worker api_key_file is unexpectedly large')
+        return value.decode('utf-8').strip()
+    finally:
+        os.close(fd)
 
 
 def worker_snapshot(name: str, worker: dict) -> dict:
+    if (
+        name != APPROVED_WORKER
+        or str(worker.get('model') or '') != APPROVED_MODEL
+        or str(worker.get('api_mode') or 'chat_completions') != APPROVED_API_MODE
+    ):
+        raise ValueError('review route does not match the approved reviewer identity')
     if not _valid_worker(name, worker):
         raise ValueError(f'invalid or disabled review worker: {name}')
     base = str(worker['base_url']).rstrip('/')
     parsed = urlparse(base)
     if parsed.scheme != 'https' or not parsed.hostname:
         raise ValueError('review worker endpoint must use HTTPS with a valid host')
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError('review worker endpoint must not contain credentials, query, or fragment')
     mode = str(worker.get('api_mode') or 'chat_completions')
     if mode not in {'anthropic_messages', 'chat_completions'}:
         raise ValueError(f'unsupported review worker api_mode: {mode}')
@@ -88,13 +116,19 @@ def worker_snapshot(name: str, worker: dict) -> dict:
     if not credential:
         raise ValueError(f'review worker has no usable credential: {name}')
     extra_headers = dict(worker.get('extra_headers') or {})
-    public = {'name': name, 'endpoint': endpoint, 'model': str(worker['model']), 'api_mode': mode}
+    public = {'name': name, 'model': str(worker['model']), 'api_mode': mode}
     # Route identity is deliberately non-secret. Credential rotation does not
     # change the logical reviewer route and secret-derived fingerprints must not
     # appear in review receipts.
-    integrity = {**public, 'extra_header_names': sorted(extra_headers)}
+    endpoint_identity = f'{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip("/")}'
+    integrity = {**public, 'endpoint_identity': endpoint_identity}
     public['route_sha'] = hashlib.sha256(json.dumps(integrity, sort_keys=True).encode()).hexdigest()
-    return {**public, 'credential': credential, 'extra_headers': extra_headers}
+    return {**public, 'endpoint': endpoint, 'credential': credential, 'extra_headers': extra_headers}
+
+
+def public_route(snapshot: dict) -> dict:
+    """Return only non-secret route identity fields safe for receipts and metrics."""
+    return {key: snapshot[key] for key in ('name', 'model', 'api_mode', 'route_sha')}
 
 
 def parse_strict_verdict(raw: str, receipt: dict) -> dict:
@@ -155,7 +189,11 @@ def extract_response(payload: dict, mode: str) -> tuple[str, dict]:
         usage = payload.get('usage') if isinstance(payload, dict) else None
         in_tokens = usage.get('prompt_tokens') if isinstance(usage, dict) else None
         out_tokens = usage.get('completion_tokens') if isinstance(usage, dict) else None
-    if not text.strip() or not isinstance(in_tokens, int) or not isinstance(out_tokens, int):
+    if (
+        not text.strip()
+        or not isinstance(in_tokens, int) or isinstance(in_tokens, bool) or in_tokens < 0
+        or not isinstance(out_tokens, int) or isinstance(out_tokens, bool) or out_tokens < 0
+    ):
         raise ValueError('review API returned no valid assistant content/usage')
     return text, usage
 
@@ -198,8 +236,13 @@ def record_success(path: Path, route_sha: str) -> None:
 
 class ReviewHTTPError(RuntimeError):
     def __init__(self, status: int, message: str):
-        super().__init__(f'HTTP {status}: {message}')
+        del message
+        super().__init__(f'HTTP {status}')
         self.status = status
+
+
+class ReviewTransportError(RuntimeError):
+    """A deliberately detail-free network failure safe for public classification."""
 
 
 def _request_json(snapshot: dict, body: dict, timeout: int) -> dict:
@@ -211,14 +254,24 @@ def _request_json(snapshot: dict, body: dict, timeout: int) -> dict:
     req = urllib.request.Request(snapshot['endpoint'], data=json.dumps(body).encode(), headers=headers, method='POST')
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context()) as resp:
-            return json.loads(resp.read().decode())
+            status = int(getattr(resp, 'status', 200))
+            if not 200 <= status <= 299:
+                resp.close()
+                raise ReviewHTTPError(status, '')
+            raw = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise ValueError('review API response exceeds size limit')
+            value = json.loads(raw.decode())
+            if not isinstance(value, dict):
+                raise ValueError('review API response must be an object')
+            return value
     except urllib.error.HTTPError as exc:
-        detail = exc.read(300).decode(errors='replace')
-        raise ReviewHTTPError(exc.code, detail) from exc
+        exc.close()
+        raise ReviewHTTPError(exc.code, '') from None
 
 
-def _review_body(snapshot: dict, prompt: str) -> dict:
-    body = {'model': snapshot['model'], 'max_tokens': 4096, 'temperature': 0, 'messages': [{'role': 'user', 'content': prompt}]}
+def _review_body(snapshot: dict, prompt: str, max_output_tokens: int) -> dict:
+    body = {'model': snapshot['model'], 'max_tokens': max_output_tokens, 'temperature': 0, 'messages': [{'role': 'user', 'content': prompt}]}
     if snapshot['api_mode'] == 'chat_completions':
         body['response_format'] = {'type': 'json_object'}
     return body
@@ -234,7 +287,8 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
                requirements: str = '', evidence: str = '', attempts: int = 2, timeout: int = 180,
                state_path: Path = STATE, runs_dir: Path = RUNS, transport=None, sleep=time.sleep,
                current_worker=None, persist: bool = True, budget_path: Path | None = None,
-               max_input_tokens: int = 120_000, daily_input_tokens: int = 1_000_000) -> dict:
+               max_input_tokens: int = 120_000, daily_input_tokens: int = 1_000_000,
+               max_output_tokens: int = 4_096, daily_output_tokens: int = 100_000) -> dict:
     snapshot = worker_snapshot(name, worker)
     route_sha = snapshot['route_sha']; assert_circuit_closed(state_path, route_sha)
     if current_worker is not None and worker_snapshot(name, current_worker())['route_sha'] != route_sha:
@@ -249,11 +303,14 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
         reservation = policy.reserve_budget(
             budget_path, route_sha=route_sha,
             estimated_input_tokens=estimated_tokens,
-            daily_limit=daily_input_tokens,
+            estimated_output_tokens=max_output_tokens,
+            daily_input_limit=daily_input_tokens,
+            daily_output_limit=daily_output_tokens,
         )
-    body = _review_body(snapshot, prompt)
+    body = _review_body(snapshot, prompt, max_output_tokens)
     transport = transport or _request_json
     started = time.monotonic(); payload = None
+    input_tokens = output_tokens = 0
     attempts = max(1, attempts)
     try:
         for attempt in range(1, attempts + 1):
@@ -268,17 +325,19 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
             except (urllib.error.URLError, TimeoutError, OSError):
                 record_failure(state_path, route_sha)
                 if attempt >= attempts:
-                    raise
+                    raise ReviewTransportError('network transport failed') from None
                 sleep(min(8.0, (2 ** (attempt - 1)) + random.random()))
         if payload is None:
             raise RuntimeError('review transport completed without a response payload')
         raw, usage = extract_response(payload, snapshot['api_mode'])
+        input_tokens = int(usage['input_tokens'] if 'input_tokens' in usage else usage['prompt_tokens'])
+        output_tokens = int(usage['output_tokens'] if 'output_tokens' in usage else usage['completion_tokens'])
         verdict = parse_strict_verdict(raw, receipt)
     except Exception:
         if budget_path is not None and reservation is not None:
             policy.reconcile_budget(
                 budget_path, reservation,
-                actual_input_tokens=0, actual_output_tokens=0,
+                actual_input_tokens=input_tokens, actual_output_tokens=output_tokens,
             )
         raise
     if current_worker is not None:
@@ -286,8 +345,7 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
         if after['route_sha'] != route_sha:
             raise RuntimeError('review worker config changed during request')
     record_success(state_path, route_sha)
-    input_tokens = usage.get('input_tokens', usage.get('prompt_tokens'))
-    output_tokens = usage.get('output_tokens', usage.get('completion_tokens'))
+
     if budget_path is not None and reservation is not None:
         policy.reconcile_budget(
             budget_path, reservation,
@@ -296,7 +354,7 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
     result = {
         'verdict': verdict,
         'receipt': receipt,
-        'route': {k: snapshot[k] for k in ('name', 'endpoint', 'model', 'api_mode', 'route_sha')},
+        'route': public_route(snapshot),
         'metrics': {'attempts': attempt, 'elapsed_ms': round((time.monotonic() - started) * 1000), 'input_tokens': input_tokens, 'output_tokens': output_tokens},
     }
     if persist:
@@ -347,7 +405,8 @@ def freeze_git_candidate(repo: Path | str) -> dict:
     return {'repo': repo, 'head': head, 'index_tree': index_tree, 'diff': diff, 'paths': paths}
 
 
-def chunk_staged_diff(repo: Path | str, paths: list[str], *, max_source_bytes: int) -> list[dict]:
+def chunk_staged_diff(repo: Path | str, paths: list[str], *, head: str,
+                      index_tree: str, max_source_bytes: int) -> list[dict]:
     """Group complete per-file staged diffs without cutting a file in half."""
     if max_source_bytes <= 0:
         raise ValueError('max_source_bytes must be positive')
@@ -357,7 +416,7 @@ def chunk_staged_diff(repo: Path | str, paths: list[str], *, max_source_bytes: i
     current_parts: list[bytes] = []
     current_size = 0
     for path in paths:
-        part = _git(repo, 'diff', '--cached', '--binary', '--', f':(literal){path}').stdout
+        part = _git(repo, 'diff', '--binary', head, index_tree, '--', f':(literal){path}').stdout
         if not part:
             raise RuntimeError(f'cannot freeze staged diff for path: {path}')
         if len(part) > max_source_bytes:
@@ -422,6 +481,7 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
                    state_path: Path = STATE, runs_dir: Path = RUNS, current_worker=None,
                    runner=run_review, budget_path: Path | None = None,
                    max_input_tokens: int = 120_000, daily_input_tokens: int = 1_000_000,
+                   max_output_tokens: int = 4_096, daily_output_tokens: int = 100_000,
                    signing_key_path: Path | None = None,
                    max_source_bytes: int = 350_000) -> dict:
     frozen = freeze_git_candidate(repo)
@@ -430,7 +490,8 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
         sources = [{'paths': frozen['paths'], 'diff': frozen['diff']}]
     else:
         sources = chunk_staged_diff(
-            frozen['repo'], frozen['paths'], max_source_bytes=max_source_bytes,
+            frozen['repo'], frozen['paths'], head=frozen['head'],
+            index_tree=frozen['index_tree'], max_source_bytes=max_source_bytes,
         )
     results = []
     for index, source in enumerate(sources, 1):
@@ -448,9 +509,13 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
             state_path=state_path, runs_dir=runs_dir, current_worker=current_worker, persist=False,
             budget_path=budget_path, max_input_tokens=max_input_tokens,
             daily_input_tokens=daily_input_tokens,
+            max_output_tokens=max_output_tokens, daily_output_tokens=daily_output_tokens,
         ))
     result = results[0] if len(results) == 1 else _aggregate_chunk_results(frozen, results)
     result.setdefault('metrics', {}).setdefault('chunk_count', len(results))
+    validate_finding_references(
+        frozen['repo'], result['verdict'], index_tree=frozen['index_tree'],
+    )
     after = freeze_git_candidate(frozen['repo'])
     if after['head'] != frozen['head'] or after['index_tree'] != frozen['index_tree']:
         raise RuntimeError('stale review verdict: Git HEAD or INDEX_TREE changed during review')
@@ -458,6 +523,25 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
         result = signing.sign_result(result, signing_key_path)
     _persist_review_result(runs_dir, result)
     return result
+
+
+def validate_finding_references(repo: Path | str, verdict: dict, *, index_tree: str) -> None:
+    """Verify each blocking finding points to a real text line in the staged index."""
+    repo = Path(repo).resolve()
+    for severity in ('p0', 'p1'):
+        for finding in verdict.get(severity, []):
+            path = str(finding['file'])
+            candidate = Path(path)
+            if candidate.is_absolute() or '..' in candidate.parts:
+                raise ValueError(f'blocking finding file is not present in staged index: {path}')
+            literal = f'{index_tree}:{path}'
+            if _git(repo, 'cat-file', '-e', literal, check=False).returncode != 0:
+                raise ValueError(f'blocking finding file is not present in staged index: {path}')
+            content = _git(repo, 'show', literal).stdout
+            if b'\0' in content:
+                raise ValueError(f'blocking finding file is not text: {path}')
+            if int(finding['line']) > len(content.splitlines()):
+                raise ValueError(f'blocking finding line is outside staged file: {path}:{finding["line"]}')
 
 
 def validate_verdict(verdict: dict, receipt: dict) -> dict:
@@ -501,242 +585,19 @@ def validate_verdict(verdict: dict, receipt: dict) -> dict:
     return verdict
 
 
-def _cc_env_values(path: Path = CC_ENV) -> dict:
-    import re
-    text = path.read_text()
-    def value(name: str) -> str:
-        m = re.search(rf'^export {name}="(.*)"$', text, re.M)
-        if not m:
-            raise ValueError(f'CC env missing {name}')
-        return m.group(1)
-    base = value('ANTHROPIC_BASE_URL').rstrip('/')
-    return {'base_url': base + ('' if base.endswith('/v1') else '/v1'), 'api_key': value('ANTHROPIC_API_KEY'), 'model': value('ANTHROPIC_MODEL')}
-
-
-def sync_cc_worker(name: str = 'cc_review_route') -> dict:
-    """Return a worker definition mirroring the current CC runtime snapshot."""
-    v = _cc_env_values()
-    return {'provider': 'custom', **v, 'api_mode': 'anthropic_messages', 'extra_headers': {'User-Agent': 'HermesAgent/1.0'}}
-
-
-def benchmark_worker(name: str, model: str, rounds: int = 3, timeout: int = 30) -> dict:
-    if rounds < 1:
-        raise ValueError('benchmark rounds must be >= 1')
-    samples = []
-    for _ in range(rounds):
-        start = time.monotonic()
-        probe(name, model, timeout)
-        samples.append(round((time.monotonic() - start) * 1000))
-    ordered = sorted(samples)
-    return {'rounds': rounds, 'samples_ms': samples, 'median_ms': ordered[len(ordered)//2], 'max_ms': max(samples)}
-
-
 def load_config() -> dict:
     import yaml
     return yaml.safe_load(CONFIG.read_text()) or {}
 
 
 def _valid_worker(name: str, worker: object) -> bool:
-    if not isinstance(worker, dict) or worker.get('enabled') is False:
+    del name
+    if not isinstance(worker, dict) or worker.get("enabled") is False:
         return False
-    if not worker.get('model') or not worker.get('base_url'):
+    if not worker.get("model") or not worker.get("base_url"):
         return False
-    return bool(worker.get('api_key') or worker.get('api_key_env') or worker.get('api_key_file'))
-
-
-def review_candidates(workers: dict) -> list[dict]:
-    rows = []
-    for name, worker in workers.items():
-        if not _valid_worker(name, worker):
-            continue
-        if str(worker.get('api_mode') or 'chat_completions') not in {'anthropic_messages', 'chat_completions'}:
-            continue
-        rows.append({
-            'name': str(name),
-            'model': str(worker.get('model')),
-            'provider': str(worker.get('provider') or 'custom'),
-            'host': urlparse(str(worker.get('base_url'))).hostname or str(worker.get('base_url')),
-            'api_mode': str(worker.get('api_mode') or 'chat_completions'),
-        })
-    return sorted(rows, key=lambda r: r['name'])
-
-
-def resolve_candidate(token: str, rows: list[dict]) -> dict:
-    token = token.strip()
-    if token.isdigit():
-        i = int(token) - 1
-        if 0 <= i < len(rows):
-            return rows[i]
-        raise ValueError(f'review worker number out of range: {token}')
-    exact = [r for r in rows if r['name'] == token]
-    if len(exact) == 1:
-        return exact[0]
-    matches = [r for r in rows if r['name'].startswith(token)]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        raise ValueError(f'ambiguous review worker: {token}')
-    raise ValueError(f'review worker not found: {token}')
+    return bool(worker.get("api_key") or worker.get("api_key_env") or worker.get("api_key_file"))
 
 
 def selected_name(cfg: dict) -> str:
-    return str((((cfg.get('delegation') or {}).get('lanes') or {}).get('critic') or {}).get('worker') or '')
-
-
-def print_rows(cfg: dict, rows: list[dict]) -> None:
-    current = selected_name(cfg)
-    for i, row in enumerate(rows, 1):
-        mark = ' ← 当前审查 worker' if row['name'] == current else ''
-        print(f"{i}. {row['name']} · {row['model']} · {row['host']} · {row['api_mode']}{mark}")
-        print(f"   /review-worker use {row['name']}")
-
-
-def patch_selected(name: str) -> None:
-    subprocess.run([
-        PYTHON, '/opt/data/scripts/safe_config_write.py', 'patch',
-        '--key', CONFIG_KEY, '--value', json.dumps(name),
-    ], check=True)
-
-
-def probe(name: str, model: str, timeout: int) -> None:
-    """Probe the exact selected worker, never a same-model sibling route."""
-    import urllib.error
-    import urllib.request
-
-    cfg = load_config()
-    worker = ((cfg.get('main_token_reserve') or {}).get('workers') or {}).get(name)
-    snapshot = worker_snapshot(name, worker)
-    if snapshot['model'] != model:
-        raise RuntimeError(f'worker model changed before probe: {name}')
-    mode = snapshot['api_mode']; url = snapshot['endpoint']; key = snapshot['credential']
-    headers = {'User-Agent': 'HermesAgent/1.0', 'Content-Type': 'application/json', **snapshot['extra_headers']}
-    if mode == 'anthropic_messages':
-        headers.update({'x-api-key': key, 'anthropic-version': '2023-06-01'})
-        body = {'model': model, 'max_tokens': 16, 'messages': [{'role': 'user', 'content': 'Return exactly OK'}]}
-    else:
-        headers['Authorization'] = 'Bearer ' + key
-        body = {'model': model, 'max_tokens': 16, 'temperature': 0, 'messages': [{'role': 'user', 'content': 'Return exactly OK'}]}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method='POST')
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context()) as resp:
-            payload = json.loads(resp.read().decode())
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f'exact-route probe failed for {name}/{model}: {exc}') from exc
-    try:
-        text, _usage = extract_response(payload, mode)
-    except ValueError as exc:
-        raise RuntimeError(f'exact-route probe returned invalid model response for {name}/{model}: {exc}') from exc
-    if text.strip() != 'OK':
-        raise RuntimeError(f'exact-route probe returned unexpected assistant content for {name}/{model}')
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(description='Manage the independent code-review worker route')
-    sub = ap.add_subparsers(dest='cmd', required=True)
-    sub.add_parser('list')
-    sub.add_parser('status')
-    sync = sub.add_parser('sync-cc')
-    sync.add_argument('--name', default='cc_review_route')
-    sync.add_argument('--timeout', type=int, default=20)
-    bench = sub.add_parser('benchmark')
-    bench.add_argument('--rounds', type=int, default=3)
-    bench.add_argument('--timeout', type=int, default=30)
-    run = sub.add_parser('run')
-    run.add_argument('--input', required=True, help='frozen diff/source bundle path')
-    run.add_argument('--head', required=True, help='immutable HEAD or snapshot identifier')
-    run.add_argument('--index-tree', required=True, help='immutable staged Git index tree')
-    run.add_argument('--requirements', default='', help='acceptance criteria text or @file')
-    run.add_argument('--evidence', default='', help='executed test/static evidence text or @file')
-    run.add_argument('--attempts', type=int, default=2)
-    run.add_argument('--timeout', type=int, default=180)
-    git_run = sub.add_parser('review-git')
-    git_run.add_argument('--repo', required=True, help='Git repository with the final candidate staged')
-    git_run.add_argument('--requirements', default='', help='acceptance criteria text or @file')
-    git_run.add_argument('--evidence', default='', help='executed test/static evidence text or @file')
-    git_run.add_argument('--attempts', type=int, default=1)
-    git_run.add_argument('--timeout', type=int, default=240)
-    use = sub.add_parser('use')
-    use.add_argument('target', help='worker name/prefix or displayed number')
-    use.add_argument('--timeout', type=int, default=20)
-    args = ap.parse_args()
-
-    cfg = load_config()
-    workers = (cfg.get('main_token_reserve') or {}).get('workers') or {}
-    rows = review_candidates(workers)
-    if args.cmd == 'list':
-        print_rows(cfg, rows)
-        return 0
-    if args.cmd == 'status':
-        name = selected_name(cfg)
-        if not name:
-            print('未配置独立代码审查 worker')
-            return 1
-        row = next((r for r in rows if r['name'] == name), None)
-        if not row:
-            print(f'配置的审查 worker 不可用或不存在: {name}')
-            return 2
-        print(f"{name} · {row['model']} · {row['host']} · {row['api_mode']} · fallback=fail")
-        return 0
-    if args.cmd == 'benchmark':
-        name = selected_name(cfg)
-        row = next((r for r in rows if r['name'] == name), None)
-        if not row:
-            print('当前审查 worker 不可用', file=sys.stderr)
-            return 2
-        print(json.dumps(benchmark_worker(name, row['model'], args.rounds, args.timeout), ensure_ascii=False))
-        return 0
-    if args.cmd in {'run', 'review-git'}:
-        name = selected_name(cfg)
-        worker = workers.get(name)
-        try:
-            def _arg_text(value: str) -> str:
-                return Path(value[1:]).read_text() if value.startswith('@') else value
-            if args.cmd == 'review-git':
-                result = run_git_review(
-                    args.repo, name, worker,
-                    requirements=_arg_text(args.requirements), evidence=_arg_text(args.evidence),
-                    attempts=args.attempts, timeout=args.timeout,
-                    current_worker=lambda: (((load_config().get('main_token_reserve') or {}).get('workers') or {}).get(name)),
-                )
-            else:
-                source = Path(args.input).read_bytes()
-                result = run_review(
-                    name, worker, source, args.head, args.index_tree,
-                    requirements=_arg_text(args.requirements), evidence=_arg_text(args.evidence),
-                    attempts=args.attempts, timeout=args.timeout,
-                    current_worker=lambda: (((load_config().get('main_token_reserve') or {}).get('workers') or {}).get(name)),
-                )
-        except Exception as exc:
-            print(f'审查失败（fail-closed）: {exc}', file=sys.stderr)
-            return 4
-        public = {'passed': result['verdict']['passed'], 'receipt': result['receipt'], 'route': result['route'], 'metrics': result['metrics'], 'verdict': result['verdict']}
-        print(json.dumps(public, ensure_ascii=False))
-        return 0
-    if args.cmd == 'sync-cc':
-        desired = sync_cc_worker(args.name)
-        current = workers.get(args.name)
-        if isinstance(current, dict) and all(current.get(k) == desired.get(k) for k in ('base_url','api_key','model','api_mode')):
-            probe(args.name, desired['model'], args.timeout)
-            if selected_name(cfg) != args.name:
-                patch_selected(args.name)
-            print(f"CC 审查路由已一致: {args.name} · {desired['model']} · {urlparse(desired['base_url']).hostname}")
-            return 0
-        print('CC 当前 API 与已注册审查 worker 不一致；为避免在脚本内重写含密钥的完整配置，请先注册/更新 named worker。', file=sys.stderr)
-        return 3
-
-    try:
-        row = resolve_candidate(args.target, rows)
-        probe(row['name'], row['model'], args.timeout)
-        patch_selected(row['name'])
-        check = selected_name(load_config())
-        if check != row['name']:
-            raise RuntimeError(f'config readback mismatch: expected {row["name"]}, got {check!r}')
-    except (ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-        print(f'切换失败（保持原审查路由不变）: {exc}', file=sys.stderr)
-        return 2
-    print(f"已切换独立代码审查 worker: {row['name']} · {row['model']} · {row['host']}")
-    return 0
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())
+    return str((((cfg.get("delegation") or {}).get("lanes") or {}).get("critic") or {}).get("worker") or "")

@@ -24,21 +24,63 @@ def test_privacy_preflight_allows_examples_and_normal_code():
 def test_budget_reservation_is_atomic_and_fail_closed(tmp_path):
     from hermes_code_review import policy
     ledger = tmp_path / 'budget.json'
-    policy.reserve_budget(ledger, route_sha='route', estimated_input_tokens=80, daily_limit=100, now=1000)
-    with pytest.raises(policy.PolicyViolation, match='budget exhausted'):
-        policy.reserve_budget(ledger, route_sha='route', estimated_input_tokens=21, daily_limit=100, now=1000)
+    policy.reserve_budget(
+        ledger, route_sha='route', estimated_input_tokens=80, estimated_output_tokens=10,
+        daily_input_limit=100, daily_output_limit=100, now=1000,
+    )
+    with pytest.raises(policy.PolicyViolation, match='input budget exhausted'):
+        policy.reserve_budget(
+            ledger, route_sha='route', estimated_input_tokens=21, estimated_output_tokens=10,
+            daily_input_limit=100, daily_output_limit=100, now=1000,
+        )
     value = json.loads(ledger.read_text())
     assert value['routes']['route']['reserved_input_tokens'] == 80
 
 
-def test_budget_reconciles_estimate_to_actual(tmp_path):
-    from hermes_code_review import policy
+def test_budget_releases_reservation_and_records_actual_usage(tmp_path):
+    from hermes_code_review.policy import reconcile_budget, reserve_budget
     ledger = tmp_path / 'budget.json'
-    reservation = policy.reserve_budget(ledger, route_sha='route', estimated_input_tokens=80, daily_limit=100, now=1000)
-    policy.reconcile_budget(ledger, reservation, actual_input_tokens=50, actual_output_tokens=10, now=1001)
+    rid = reserve_budget(
+        ledger, route_sha='route', estimated_input_tokens=40,
+        estimated_output_tokens=20, daily_input_limit=100, daily_output_limit=50,
+    )
+    reconcile_budget(ledger, rid, actual_input_tokens=30, actual_output_tokens=5)
     row = json.loads(ledger.read_text())['routes']['route']
-    assert row['reserved_input_tokens'] == 0
-    assert row['input_tokens'] == 50 and row['output_tokens'] == 10
+    assert row == {
+        'input_tokens': 30, 'output_tokens': 5,
+        'reserved_input_tokens': 0, 'reserved_output_tokens': 0,
+    }
+
+
+def test_output_budget_is_reserved_atomically(tmp_path):
+    from hermes_code_review.policy import PolicyViolation, reserve_budget
+    ledger = tmp_path / 'budget.json'
+    reserve_budget(
+        ledger, route_sha='route', estimated_input_tokens=1,
+        estimated_output_tokens=40, daily_input_limit=100, daily_output_limit=50,
+    )
+    with pytest.raises(PolicyViolation, match='output budget'):
+        reserve_budget(
+            ledger, route_sha='route', estimated_input_tokens=1,
+            estimated_output_tokens=20, daily_input_limit=100, daily_output_limit=50,
+        )
+
+
+def test_budget_lock_and_ledger_symlinks_fail_closed(tmp_path):
+    from hermes_code_review import policy
+    target = tmp_path / 'target'; target.write_text('{}')
+    ledger = tmp_path / 'budget.json'
+    lock = tmp_path / '.budget.json.lock'; lock.symlink_to(target)
+    with pytest.raises(policy.PolicyViolation, match='unsafe policy lock'):
+        policy.reserve_budget(ledger, route_sha='r', estimated_input_tokens=1,
+                              estimated_output_tokens=1, daily_input_limit=10,
+                              daily_output_limit=10)
+    lock.unlink(); ledger.symlink_to(target)
+    with pytest.raises(policy.PolicyViolation, match='unsafe budget ledger'):
+        policy.reserve_budget(ledger, route_sha='r', estimated_input_tokens=1,
+                              estimated_output_tokens=1, daily_input_limit=10,
+                              daily_output_limit=10)
+
 
 
 def test_request_token_cap_is_checked_before_transport():

@@ -65,6 +65,13 @@ def run_benchmark(cases: list[dict[str, Any]], reviewer: str, worker: dict[str, 
         "do not assume tests make unsafe code acceptable."
     )
     evidence = "Synthetic known-defect corpus; no external evidence and no credentials."
+    core.worker_snapshot(reviewer, worker)
+    core.policy.check_privacy([str(case['file']) for case in cases], source, acceptance, evidence)
+    runner_kwargs.setdefault('budget_path', core.BUDGET)
+    runner_kwargs.setdefault('max_input_tokens', 120_000)
+    runner_kwargs.setdefault('daily_input_tokens', 1_000_000)
+    runner_kwargs.setdefault('max_output_tokens', 4_096)
+    runner_kwargs.setdefault('daily_output_tokens', 100_000)
     call = runner or core.run_review
     result = call(
         source, acceptance, evidence, reviewer, worker,

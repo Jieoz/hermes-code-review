@@ -31,6 +31,8 @@ jobs:
           python -m build
           tar -tf dist/*.tar.gz | grep -q 'plugin.yaml'
           tar -tf dist/*.tar.gz | grep -q 'corpus/known_defects.json'
+          tar -tf dist/*.tar.gz | grep -q 'scripts/hermes-code-review'
+          python -c "import glob,tarfile; t=tarfile.open(glob.glob('dist/*.tar.gz')[0]); m=next(x for x in t.getmembers() if x.name.endswith('/scripts/hermes-code-review')); assert m.mode & 0o111 == 0o111"
           python -m pip install --force-reinstall dist/*.whl
           python -c 'import hermes_code_review; from hermes_code_review.plugin import register; assert callable(register)'
           hermes-code-review --help

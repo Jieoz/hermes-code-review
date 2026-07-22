@@ -22,7 +22,7 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("result")
     verify.add_argument("--key-file", required=True)
 
-    sub.add_parser("status", help="Show the fixed reviewer route without credentials")
+    sub.add_parser("status", help="Show fixed-route local readiness without credentials or a network probe")
     return parser
 
 

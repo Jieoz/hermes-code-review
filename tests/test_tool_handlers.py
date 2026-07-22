@@ -96,12 +96,54 @@ def test_public_result_is_whitelisted_and_rejects_known_credential(monkeypatch, 
 
 
 def test_status_tool_is_non_secret(monkeypatch):
-    from hermes_code_review import plugin
+    from hermes_code_review import __version__, plugin
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
         'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
         'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
     })
+    monkeypatch.setattr(
+        plugin.core, '_request_json',
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError('network probe')),
+    )
     value = json.loads(plugin.code_review_status({}))
     assert value['status'] == 'READY'
     assert value['worker'] == 'hybgzs_grok45' and value['model'] == 'grok-4.5'
+    assert value['version'] == __version__
     assert 'secret' not in json.dumps(value)
+
+
+def test_status_tool_fails_closed_when_reviewer_circuit_is_open(monkeypatch, tmp_path):
+    from hermes_code_review import core, plugin
+    monkeypatch.setattr(plugin.core, 'STATE', tmp_path / 'health.json')
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
+        'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
+    })
+    snapshot = core.worker_snapshot(core.APPROVED_WORKER, configured_worker())
+    core.record_failure(plugin.core.STATE, snapshot['route_sha'], threshold=1, cooldown=300, now=100)
+    monkeypatch.setattr(plugin.core.time, 'time', lambda: 101)
+    monkeypatch.setattr(
+        plugin.core, '_request_json',
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError('network probe')),
+    )
+
+    value = json.loads(plugin.code_review_status({}))
+
+    assert value == {'status': 'INFRA_FAILED', 'error_class': 'CIRCUIT_OPEN'}
+
+
+def test_status_tool_sanitizes_route_failures_and_never_probes_network(monkeypatch):
+    from hermes_code_review import plugin
+    monkeypatch.setattr(
+        plugin.core, '_request_json',
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError('network probe')),
+    )
+    monkeypatch.setattr(
+        plugin, '_route',
+        lambda: (_ for _ in ()).throw(RuntimeError('sensitive path blocked')),
+    )
+
+    value = json.loads(plugin.code_review_status({}))
+
+    assert value == {'status': 'INFRA_FAILED', 'error_class': 'PRIVACY'}
+    assert 'sensitive path blocked' not in json.dumps(value)

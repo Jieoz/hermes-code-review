@@ -41,6 +41,8 @@ def classify_error(message: str) -> str:
         return 'INVALID_VERDICT'
     if 'stale' in text:
         return 'STALE'
+    if 'circuit open' in text:
+        return 'CIRCUIT_OPEN'
     if 'budget' in text:
         return 'BUDGET'
     if 'secret' in text or 'sensitive path' in text:

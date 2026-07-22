@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+resolve_script() {
+    target=$1
+    hops=0
+    while [ -L "$target" ]; do
+        hops=$((hops + 1))
+        if [ "$hops" -gt 40 ]; then
+            printf '%s\n' 'hermes-code-review: symlink chain is too deep' >&2
+            return 1
+        fi
+        directory=$(CDPATH= cd -P "$(dirname "$target")" && pwd)
+        link=$(readlink "$target")
+        case "$link" in
+            /*) target=$link ;;
+            *) target=$directory/$link ;;
+        esac
+    done
+    directory=$(CDPATH= cd -P "$(dirname "$target")" && pwd)
+    printf '%s/%s\n' "$directory" "$(basename "$target")"
+}
+
+SCRIPT=$(resolve_script "$0")
+ROOT=$(CDPATH= cd -P "$(dirname "$SCRIPT")/.." && pwd)
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$ROOT/src:$PYTHONPATH"
+else
+    export PYTHONPATH="$ROOT/src"
+fi
+exec python3 -m hermes_code_review.cli "$@"

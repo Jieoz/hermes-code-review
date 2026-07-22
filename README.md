@@ -29,6 +29,33 @@ Restart Hermes through the deployment's controlled restart entrypoint after enab
 
 It does **not** override `delegate_task` or patch `/opt/hermes` source files.
 
+## Automatic agent gate
+
+Hermes agents should invoke `review_git_candidate` proactively after deterministic
+tests/builds are green and before any commit, push, merge, tag, Release, or other
+high-risk handoff. The caller must stage only the intended candidate and provide
+the acceptance criteria plus concrete test/static evidence. A changed candidate
+invalidates the verdict and must be reviewed again.
+
+Do not spend this gate on read-only investigation, early work-in-progress edits,
+or documentation-only changes. It is the final independent gate, not a substitute
+for implementation tests.
+
+**`code_review_status` is never a release gate.** Only a signed substantive
+`review_git_candidate` PASS for the unchanged staged candidate can authorize the
+handoff.
+
+The fixed invocation path is:
+
+```text
+test/build/static gates
+  -> stage explicit intended paths
+  -> require no tracked unstaged or non-ignored untracked files
+  -> review_git_candidate(repo, requirements, evidence)
+  -> require signed PASS + safe_to_commit=true
+  -> re-check HEAD + INDEX_TREE before commit/release
+```
+
 ## Configuration
 
 The fixed route reuses a named worker from `main_token_reserve.workers`:
@@ -62,6 +89,14 @@ Credential files must be regular files under `/opt/data/secrets/reserve_keys` wi
 
 ## CLI
 
+An installed wheel provides the `hermes-code-review` console command. A drop-in
+plugin checkout can expose the same fixed command without package installation:
+
+```bash
+ln -sfn /absolute/plugin/checkout/scripts/hermes-code-review \
+  ~/.local/bin/hermes-code-review
+```
+
 ```bash
 hermes-code-review status
 hermes-code-review review-git \
@@ -69,6 +104,10 @@ hermes-code-review review-git \
   --requirements 'Describe the intended behavior and release criteria.' \
   --evidence 'pytest, lint, type-check and security-scan results'
 ```
+
+`status` is deliberately local and free: it validates the approved route,
+credential-file contract, and circuit-breaker state without spending a reviewer
+request. Only a substantive candidate review proves end-to-end reviewer service.
 
 Exit codes:
 

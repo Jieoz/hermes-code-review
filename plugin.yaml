@@ -1,5 +1,5 @@
 name: hermes-code-review
-version: 0.1.0
+version: 0.1.2
 description: Fail-closed, immutable Git candidate review with a fixed independent model route.
 provides_tools:
   - review_git_candidate

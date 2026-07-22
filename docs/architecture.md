@@ -23,6 +23,14 @@ It receives no terminal, Docker, SSH, filesystem, GitHub, or secret-file access.
 8. Build the aggregate receipt, sign it locally, and atomically persist it.
 9. Allow release only when the signature verifies and `safe_to_commit=true`.
 
+## Agent invocation contract
+
+The release owner invokes this gate proactively after all deterministic checks and
+before commit/push/release. The gate covers only the staged HEAD + index tree it
+receives. Any code, test, documentation, packaging, or staging change invalidates
+the prior verdict. Read-only investigation and incomplete work are intentionally
+outside the gate so reviewer budget is spent only on final candidates.
+
 ## Route identity
 
 The route fingerprint hashes only provider name, model, normalized API mode, and canonical endpoint. It never hashes or serializes API keys, authorization headers, or key-file contents.

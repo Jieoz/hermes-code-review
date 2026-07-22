@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import core, observability, policy, signing
+from . import __version__, core, observability, policy, signing
 
 SIGNING_KEY = core.HERMES_HOME / "secrets/code_review_receipt.key"
 METRICS = core.HERMES_HOME / "state/code_review_metrics.jsonl"
@@ -26,7 +26,7 @@ REVIEW_SCHEMA = {
 
 STATUS_SCHEMA = {
     "name": "code_review_status",
-    "description": "Read the fixed independent reviewer identity and health without exposing credentials.",
+    "description": "Read the fixed reviewer identity and local readiness (configuration and circuit state) without exposing credentials or spending a network probe.",
     "parameters": {"type": "object", "properties": {}},
 }
 
@@ -128,20 +128,28 @@ def review_git_candidate(args: dict, **_: Any) -> str:
         return json.dumps({"status": "INFRA_FAILED", "error_class": _error_class(exc)}, ensure_ascii=False, sort_keys=True)
 
 
+def _local_status_payload() -> dict:
+    """Validate the fixed local route without making a reviewer request."""
+    name, _worker, _cfg, snapshot = _route()
+    core.assert_circuit_closed(core.STATE, snapshot["route_sha"])
+    return {
+        "status": "READY",
+        "version": __version__,
+        "worker": name,
+        "model": snapshot["model"],
+        "api_mode": snapshot["api_mode"],
+        "route_sha": snapshot["route_sha"],
+        "fallback": "fail",
+    }
+
+
 def code_review_status(args: dict, **_: Any) -> str:
     del args
     try:
-        name, _worker, _cfg, snapshot = _route()
-        return json.dumps({
-            "status": "READY",
-            "worker": name,
-            "model": snapshot["model"],
-            "api_mode": snapshot["api_mode"],
-            "route_sha": snapshot["route_sha"],
-            "fallback": "fail",
-        }, ensure_ascii=False, sort_keys=True)
+        payload = _local_status_payload()
     except Exception as exc:
-        return json.dumps({"status": "INFRA_FAILED", "error_class": _error_class(exc)}, ensure_ascii=False, sort_keys=True)
+        payload = {"status": "INFRA_FAILED", "error_class": _error_class(exc)}
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def register(ctx) -> None:

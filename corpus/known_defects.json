@@ -1,0 +1,30 @@
+[
+  {
+    "id": "shell-injection",
+    "file": "app/export.py",
+    "severity": "p1",
+    "keywords": ["shell", "injection"],
+    "diff": "diff --git a/app/export.py b/app/export.py\nindex 1111111..2222222 100644\n--- a/app/export.py\n+++ b/app/export.py\n@@ -8,2 +8,2 @@\n-def export(name): return subprocess.run([\"tar\", \"-cf\", name])\n+def export(name): return subprocess.run(\"tar -cf \" + name, shell=True)\n"
+  },
+  {
+    "id": "fail-open-auth",
+    "file": "app/auth.py",
+    "severity": "p1",
+    "keywords": ["fail", "auth"],
+    "diff": "diff --git a/app/auth.py b/app/auth.py\nindex 1111111..2222222 100644\n--- a/app/auth.py\n+++ b/app/auth.py\n@@ -15,3 +15,4 @@\n def allowed(token):\n-    return verifier.check(token)\n+    try: return verifier.check(token)\n+    except Exception: return True\n"
+  },
+  {
+    "id": "zip-slip",
+    "file": "app/archive.py",
+    "severity": "p1",
+    "keywords": ["path", "traversal"],
+    "diff": "diff --git a/app/archive.py b/app/archive.py\nindex 1111111..2222222 100644\n--- a/app/archive.py\n+++ b/app/archive.py\n@@ -21,2 +21,2 @@\n-def unpack(z, root): safe_extract(z, root)\n+def unpack(z, root): z.extractall(root)\n"
+  },
+  {
+    "id": "toctou-index",
+    "file": "release/gate.py",
+    "severity": "p1",
+    "keywords": ["race", "index"],
+    "diff": "diff --git a/release/gate.py b/release/gate.py\nindex 1111111..2222222 100644\n--- a/release/gate.py\n+++ b/release/gate.py\n@@ -30,3 +30,3 @@\n candidate = git_index_tree()\n review(candidate)\n-publish(candidate)\n+publish(git_index_tree())\n"
+  }
+]

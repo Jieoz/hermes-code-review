@@ -24,7 +24,7 @@
     "id": "toctou-index",
     "file": "release/gate.py",
     "severity": "p1",
-    "keywords": ["race", "index"],
+    "keywords": ["toctou", "index"],
     "diff": "diff --git a/release/gate.py b/release/gate.py\nindex 1111111..2222222 100644\n--- a/release/gate.py\n+++ b/release/gate.py\n@@ -30,3 +30,3 @@\n candidate = git_index_tree()\n review(candidate)\n-publish(candidate)\n+publish(git_index_tree())\n"
   }
 ]

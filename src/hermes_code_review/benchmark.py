@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,8 @@ def run_benchmark(cases: list[dict[str, Any]], reviewer: str, worker: dict[str, 
 
     source = build_bundle(cases)
     digest = hashlib.sha256(source).hexdigest()
+    # Synthetic identity only: benchmark receipts must not be presented as Git
+    # release-candidate receipts.
     snapshot = {"head": digest, "index_tree": digest, "diff_sha": digest}
     acceptance = (
         "Independent blind benchmark. Review every supplied unified diff. "
@@ -65,6 +68,12 @@ def run_benchmark(cases: list[dict[str, Any]], reviewer: str, worker: dict[str, 
         "do not assume tests make unsafe code acceptable."
     )
     evidence = "Synthetic known-defect corpus; no external evidence and no credentials."
+    if (
+        reviewer != core.APPROVED_WORKER
+        or str(worker.get('model') or '') != core.APPROVED_MODEL
+        or str(worker.get('api_mode') or 'chat_completions') != core.APPROVED_API_MODE
+    ):
+        raise ValueError('benchmark route is not the fixed approved reviewer')
     core.worker_snapshot(reviewer, worker)
     core.policy.check_privacy([str(case['file']) for case in cases], source, acceptance, evidence)
     runner_kwargs.setdefault('budget_path', core.BUDGET)
@@ -72,9 +81,13 @@ def run_benchmark(cases: list[dict[str, Any]], reviewer: str, worker: dict[str, 
     runner_kwargs.setdefault('daily_input_tokens', 1_000_000)
     runner_kwargs.setdefault('max_output_tokens', 4_096)
     runner_kwargs.setdefault('daily_output_tokens', 100_000)
+    for key in ('max_input_tokens', 'daily_input_tokens', 'max_output_tokens', 'daily_output_tokens'):
+        if int(runner_kwargs[key]) <= 0:
+            raise ValueError(f'{key} must be positive')
     call = runner or core.run_review
-    result = call(
-        source, acceptance, evidence, reviewer, worker,
-        timeout=timeout, snapshot=snapshot, persist=False, **runner_kwargs,
-    )
+    args = (reviewer, worker, source, snapshot['head'], snapshot['index_tree'])
+    kwargs = dict(requirements=acceptance, evidence=evidence, timeout=timeout,
+                  persist=False, **runner_kwargs)
+    inspect.signature(call).bind(*args, **kwargs)
+    result = call(*args, **kwargs)
     return {"evaluation": evaluate_verdict(cases, result["verdict"]), "review": result}

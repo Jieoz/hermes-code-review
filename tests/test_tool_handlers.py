@@ -33,6 +33,7 @@ def test_review_tool_returns_machine_pass(monkeypatch, tmp_path):
     assert value['status'] == 'PASS'
     assert value['receipt']['reviewer_model'] == 'grok-4.5'
     assert seen['signing_key_path'] == plugin.SIGNING_KEY
+    assert seen['max_source_bytes'] == 350_000
     event = json.loads(plugin.METRICS.read_text())
     assert event['status'] == 'PASS' and event['route_sha'] == 'route'
     assert 'secret' not in json.dumps(value)

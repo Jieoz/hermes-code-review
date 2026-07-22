@@ -65,6 +65,7 @@ def review_git_candidate(args: dict, **_: Any) -> str:
             max_input_tokens=int(settings.get("max_input_tokens") or 120_000),
             daily_input_tokens=int(settings.get("daily_input_tokens") or 1_000_000),
             signing_key_path=SIGNING_KEY,
+            max_source_bytes=int(settings.get("max_source_bytes") or 350_000),
         )
         verdict = result["verdict"]
         status = "PASS" if verdict.get("passed") is True and verdict.get("safe_to_commit") is True else "BLOCKED"

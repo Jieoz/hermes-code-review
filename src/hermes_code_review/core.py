@@ -347,21 +347,110 @@ def freeze_git_candidate(repo: Path | str) -> dict:
     return {'repo': repo, 'head': head, 'index_tree': index_tree, 'diff': diff, 'paths': paths}
 
 
+def chunk_staged_diff(repo: Path | str, paths: list[str], *, max_source_bytes: int) -> list[dict]:
+    """Group complete per-file staged diffs without cutting a file in half."""
+    if max_source_bytes <= 0:
+        raise ValueError('max_source_bytes must be positive')
+    repo = Path(repo).resolve()
+    chunks: list[dict] = []
+    current_paths: list[str] = []
+    current_parts: list[bytes] = []
+    current_size = 0
+    for path in paths:
+        part = _git(repo, 'diff', '--cached', '--binary', '--', f':(literal){path}').stdout
+        if not part:
+            raise RuntimeError(f'cannot freeze staged diff for path: {path}')
+        if len(part) > max_source_bytes:
+            raise RuntimeError(f'single-file staged diff exceeds review chunk limit: {path}')
+        if current_parts and current_size + len(part) > max_source_bytes:
+            chunks.append({'paths': current_paths, 'diff': b''.join(current_parts)})
+            current_paths, current_parts, current_size = [], [], 0
+        current_paths.append(path)
+        current_parts.append(part)
+        current_size += len(part)
+    if current_parts:
+        chunks.append({'paths': current_paths, 'diff': b''.join(current_parts)})
+    return chunks
+
+
+def _aggregate_chunk_results(frozen: dict, results: list[dict]) -> dict:
+    if not results:
+        raise RuntimeError('segmented review produced no chunk results')
+    first = results[0]
+    route = first['route']
+    route_sha = route['route_sha']
+    model = route['model']
+    if any(row['route'].get('route_sha') != route_sha or row['route'].get('model') != model for row in results):
+        raise RuntimeError('segmented review route identity changed between chunks')
+    receipt = snapshot_receipt_bytes(
+        frozen['diff'], frozen['head'], frozen['index_tree'],
+        route_sha=route_sha, reviewer_model=model,
+    )
+    combined = {key: [] for key in ('p0', 'p1', 'p2', 'needs_evidence', 'security_concerns')}
+    for row in results:
+        for key in combined:
+            combined[key].extend(row['verdict'][key])
+    passed = all(row['verdict']['passed'] is True for row in results) and not any(combined.values())
+    safe = passed and all(row['verdict']['safe_to_commit'] is True for row in results)
+    verdict = {
+        'passed': passed,
+        **receipt,
+        **combined,
+        'safe_to_commit': safe,
+        'summary': f"Segmented review completed across {len(results)} immutable file-boundary chunks; "
+                   + ('all chunks passed.' if safe else 'one or more chunks blocked.'),
+    }
+    validate_verdict(verdict, receipt)
+    metrics = {
+        'attempts': sum(int(row['metrics'].get('attempts') or 0) for row in results),
+        'elapsed_ms': sum(int(row['metrics'].get('elapsed_ms') or 0) for row in results),
+        'input_tokens': sum(int(row['metrics'].get('input_tokens') or 0) for row in results),
+        'output_tokens': sum(int(row['metrics'].get('output_tokens') or 0) for row in results),
+        'chunk_count': len(results),
+    }
+    return {
+        'verdict': verdict,
+        'receipt': receipt,
+        'route': route,
+        'metrics': metrics,
+        'chunk_receipts': [row['receipt'] for row in results],
+    }
+
+
 def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: str = '',
                    evidence: str = '', attempts: int = 1, timeout: int = 240,
                    state_path: Path = STATE, runs_dir: Path = RUNS, current_worker=None,
                    runner=run_review, budget_path: Path | None = None,
                    max_input_tokens: int = 120_000, daily_input_tokens: int = 1_000_000,
-                   signing_key_path: Path | None = None) -> dict:
+                   signing_key_path: Path | None = None,
+                   max_source_bytes: int = 350_000) -> dict:
     frozen = freeze_git_candidate(repo)
     policy.check_privacy(frozen['paths'], frozen['diff'], requirements, evidence)
-    result = runner(
-        name, worker, frozen['diff'], frozen['head'], frozen['index_tree'],
-        requirements=requirements, evidence=evidence, attempts=attempts, timeout=timeout,
-        state_path=state_path, runs_dir=runs_dir, current_worker=current_worker, persist=False,
-        budget_path=budget_path, max_input_tokens=max_input_tokens,
-        daily_input_tokens=daily_input_tokens,
-    )
+    if len(frozen['diff']) <= max_source_bytes:
+        sources = [{'paths': frozen['paths'], 'diff': frozen['diff']}]
+    else:
+        sources = chunk_staged_diff(
+            frozen['repo'], frozen['paths'], max_source_bytes=max_source_bytes,
+        )
+    results = []
+    for index, source in enumerate(sources, 1):
+        segment_note = ''
+        if len(sources) > 1:
+            segment_note = (
+                f"\n\nSegment {index}/{len(sources)}. This segment contains complete diffs for: "
+                + ', '.join(source['paths'])
+                + ". Treat the shared HEAD and INDEX_TREE as the authoritative full candidate identity."
+            )
+        results.append(runner(
+            name, worker, source['diff'], frozen['head'], frozen['index_tree'],
+            requirements=requirements + segment_note, evidence=evidence,
+            attempts=attempts, timeout=timeout,
+            state_path=state_path, runs_dir=runs_dir, current_worker=current_worker, persist=False,
+            budget_path=budget_path, max_input_tokens=max_input_tokens,
+            daily_input_tokens=daily_input_tokens,
+        ))
+    result = results[0] if len(results) == 1 else _aggregate_chunk_results(frozen, results)
+    result.setdefault('metrics', {}).setdefault('chunk_count', len(results))
     after = freeze_git_candidate(frozen['repo'])
     if after['head'] != frozen['head'] or after['index_tree'] != frozen['index_tree']:
         raise RuntimeError('stale review verdict: Git HEAD or INDEX_TREE changed during review')

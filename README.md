@@ -6,12 +6,14 @@ Fail-closed independent code review for immutable staged Git candidates in [Herm
 
 - Reviews exactly `HEAD + INDEX_TREE`; a changed HEAD or index produces `STALE`.
 - Rejects tracked unstaged files and non-ignored untracked files.
-- Uses one configured reviewer identity; there is no silent provider/model fallback.
+- Uses an explicit ordered reviewer pool restricted to approved model/transport identities; only infrastructure failures advance to the next route.
+- Never shops for a PASS: a valid `BLOCKED` verdict is final and cannot trigger fallback.
 - Blocks sensitive paths and secret-like material before any remote request.
-- Enforces per-request and daily token budgets.
+- Applies no self-imposed daily token cap by default; provider/account limits remain authoritative.
 - Splits large staged diffs into deterministic file chunks bound to one immutable candidate.
 - Requires strict JSON findings with valid `file:line` for P0/P1.
-- Signs the final receipt with a local HMAC key and records redacted metrics.
+- Binds receipts to requirements and evidence hashes, then signs them locally with HMAC.
+- Reuses an existing verified PASS only when candidate, route, requirements, and evidence all match exactly.
 
 Model review is an additional gate, not a replacement for tests, lint, type checks, or security scanners.
 
@@ -52,39 +54,48 @@ test/build/static gates
   -> stage explicit intended paths
   -> require no tracked unstaged or non-ignored untracked files
   -> review_git_candidate(repo, requirements, evidence)
+     (remote input is the frozen diff; concurrent Git changes make the verdict stale)
   -> require signed PASS + safe_to_commit=true
   -> re-check HEAD + INDEX_TREE before commit/release
 ```
 
 ## Configuration
 
-The fixed route reuses a named worker from `main_token_reserve.workers`:
+The ordered pool reuses named workers from `main_token_reserve.workers`. It is
+explicit configuration, not an automatic or open fallback pool. Multiple providers
+may serve an approved reviewer model so one API circuit cannot halt the gate:
 
 ```yaml
-delegation:
-  lanes:
-    critic:
-      worker: independent_reviewer
-      fallback: fail
-
 main_token_reserve:
   workers:
-    independent_reviewer:
+    gpt_review:
       enabled: true
       provider: custom
-      model: your-review-model
-      base_url: https://review.example/v1
+      model: gpt-5.6-sol
+      base_url: https://primary-review.example/v1
       api_mode: chat_completions
-      api_key_file: /opt/data/secrets/reserve_keys/independent_reviewer
+      api_key_file: /opt/data/secrets/reserve_keys/gpt_review
+    opus_review:
+      enabled: true
+      provider: custom
+      model: claude-opus-4-8
+      base_url: https://fallback-review.example/v1
+      api_mode: anthropic_messages
+      api_key_file: /opt/data/secrets/reserve_keys/opus_review
 
 code_review:
-  max_source_bytes: 350000
+  workers: [gpt_review, opus_review]
+  max_source_bytes: 200000
   max_input_tokens: 120000
-  daily_input_tokens: 1000000
-  max_output_tokens: 4096
-  daily_output_tokens: 100000
+  max_output_tokens: 8192
 ```
 
+`max_input_tokens` and `max_output_tokens` are per-request payload bounds, not
+daily quotas. Optional operator-defined daily caps remain supported only when
+explicitly configured; zero or omitted daily limits mean unlimited.
+
+Approved identities are currently `gpt-5.6-sol/chat_completions`,
+`claude-opus-4-8/anthropic_messages`, and `grok-4.5/chat_completions`.
 Credential files must be regular files under `/opt/data/secrets/reserve_keys` with mode `0600`. Credentials, base URLs, and authorization headers are excluded from receipts and metrics.
 
 ## CLI
@@ -102,12 +113,31 @@ hermes-code-review status
 hermes-code-review review-git \
   --repo /path/to/repo \
   --requirements 'Describe the intended behavior and release criteria.' \
-  --evidence 'pytest, lint, type-check and security-scan results'
+  --evidence 'pytest, lint, type-check and security-scan results' \
+  --release-gate
 ```
 
-`status` is deliberately local and free: it validates the approved route,
-credential-file contract, and circuit-breaker state without spending a reviewer
-request. Only a substantive candidate review proves end-to-end reviewer service.
+`--release-gate` matters only when an operator has explicitly configured an
+optional release reserve. With the default unlimited daily policy it has no
+quota effect.
+
+`status` is deliberately local and free: it validates every configured approved
+route, credential-file contract, circuit state, and observed usage without
+spending a reviewer request. Only a substantive candidate review proves end-to-end
+reviewer service.
+
+The fallback is attempted only after retryable transport/server/rate-limit/circuit
+failure, or after one same-route retry still produces an invalid strict verdict.
+Privacy, budget, policy, stale-candidate, and valid `BLOCKED` outcomes never trigger
+fallback. The returned receipt identifies the reviewer that actually produced it.
+
+## Signed PASS reuse
+
+Before making a remote request, the plugin may reuse a persisted signed PASS only
+when all of these match exactly: `HEAD`, `INDEX_TREE`, staged diff SHA, approved
+route identity, reviewer model, requirements SHA, and evidence SHA. The signature
+is verified before reuse. Any changed requirement, evidence, code, route, invalid
+signature, or non-PASS verdict forces a new review.
 
 Exit codes:
 

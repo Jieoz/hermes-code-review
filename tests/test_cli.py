@@ -44,3 +44,17 @@ def test_cli_rejects_infra_result(monkeypatch, tmp_path):
     from hermes_code_review import cli
     monkeypatch.setattr(cli.plugin, "review_git_candidate", lambda args: json.dumps({"status": "INFRA_FAILED", "safe_to_commit": False}))
     assert cli.main(["review-git", "--repo", str(tmp_path), "--requirements", "r", "--evidence", "e"]) == 3
+
+
+def test_cli_release_gate_is_explicitly_forwarded(monkeypatch, tmp_path):
+    from hermes_code_review import cli
+    seen = {}
+    monkeypatch.setattr(
+        cli.plugin, "review_git_candidate",
+        lambda args: seen.update(args) or json.dumps({"status": "INFRA_FAILED"}),
+    )
+    assert cli.main([
+        "review-git", "--repo", str(tmp_path), "--requirements", "r",
+        "--evidence", "e", "--release-gate",
+    ]) == 3
+    assert seen["release_gate"] is True

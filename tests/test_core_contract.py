@@ -53,7 +53,9 @@ def test_route_fingerprint_excludes_credentials():
 def test_keyfile_must_be_0600_and_under_allowed_dir(tmp_path, monkeypatch):
     from hermes_code_review import core
     monkeypatch.setattr(core, 'RESERVE_KEY_DIR', tmp_path)
-    path = tmp_path / 'key'; path.write_text('secret\n'); path.chmod(0o600)
+    path = tmp_path / 'key'
+    path.write_text('secret\n')
+    path.chmod(0o600)
     worker = {'provider': 'custom', 'base_url': 'https://review.example/v1', 'model': 'grok-4.5', 'api_mode': 'chat_completions', 'enabled': True, 'api_key_file': str(path)}
     assert core.worker_snapshot(core.APPROVED_WORKER, worker)['credential'] == 'secret'
     path.chmod(0o644)
@@ -64,15 +66,22 @@ def test_keyfile_must_be_0600_and_under_allowed_dir(tmp_path, monkeypatch):
     link.symlink_to(path)
     with pytest.raises(ValueError, match='regular file'):
         core.worker_snapshot(core.APPROVED_WORKER, {**worker, 'api_key_file': str(link)})
-    nested = tmp_path / 'nested'; nested.mkdir()
-    nested_key = nested / 'key'; nested_key.write_text('secret'); nested_key.chmod(0o600)
+    nested = tmp_path / 'nested'
+    nested.mkdir()
+    nested_key = nested / 'key'
+    nested_key.write_text('secret')
+    nested_key.chmod(0o600)
     with pytest.raises(ValueError, match='direct child'):
         core.worker_snapshot(core.APPROVED_WORKER, {**worker, 'api_key_file': str(nested_key)})
 
 
 def test_strict_verdict_requires_evidence_and_identity():
     from hermes_code_review import core
-    receipt = {'review_head': 'h', 'review_index_tree': 't', 'review_diff_sha': 'd', 'review_route_sha': 'r', 'reviewer_model': 'grok-4.5'}
+    receipt = {
+        'review_head': 'h', 'review_index_tree': 't', 'review_diff_sha': 'd',
+        'review_route_sha': 'r', 'reviewer_model': 'grok-4.5',
+        'review_requirements_sha': 'q', 'review_evidence_sha': 'e',
+    }
     value = {'passed': False, **receipt, 'p0': [], 'p1': [{'file': 'x.py', 'line': 1, 'issue': 'bug'}], 'p2': [], 'needs_evidence': [], 'security_concerns': [], 'safe_to_commit': False, 'summary': 'blocked'}
     assert core.validate_verdict(value, receipt) == value
     value['p1'] = ['vague']
@@ -85,7 +94,8 @@ def test_strict_verdict_requires_evidence_and_identity():
     inconsistent = {**valid, 'safe_to_commit': False}
     with pytest.raises(ValueError, match='inconsistent'):
         core.validate_verdict(inconsistent, receipt)
-    missing = dict(valid); missing.pop('review_route_sha')
+    missing = dict(valid)
+    missing.pop('review_route_sha')
     with pytest.raises(ValueError, match='schema'):
         core.validate_verdict(missing, receipt)
 

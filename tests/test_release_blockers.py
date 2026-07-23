@@ -16,7 +16,7 @@ def approved_worker(**updates):
     return value
 
 
-def test_reviewer_identity_is_hard_fixed():
+def test_reviewer_identity_is_restricted_by_model_and_transport_not_provider_name():
     from hermes_code_review import core
     snapshot = core.worker_snapshot('hybgzs_grok45', approved_worker())
     assert snapshot['model'] == 'grok-4.5'
@@ -25,12 +25,28 @@ def test_reviewer_identity_is_hard_fixed():
     assert 'token' not in json.dumps(core.public_route(snapshot))
     with pytest.raises(ValueError, match='must not contain credentials'):
         core.worker_snapshot('hybgzs_grok45', approved_worker(base_url='https://review.example/v1?token=x'))
-    with pytest.raises(ValueError, match='approved reviewer'):
-        core.worker_snapshot('other', approved_worker())
+    assert core.worker_snapshot('other-grok-route', approved_worker())['model'] == 'grok-4.5'
     with pytest.raises(ValueError, match='approved reviewer'):
         core.worker_snapshot('hybgzs_grok45', approved_worker(model='other'))
     with pytest.raises(ValueError, match='approved reviewer'):
         core.worker_snapshot('hybgzs_grok45', approved_worker(api_mode='anthropic_messages'))
+
+
+def test_preapproved_fallback_reviewer_has_a_different_fixed_identity():
+    from hermes_code_review import core
+    fallback = approved_worker(
+        base_url='https://fallback.example/v1', model='claude-opus-4-8',
+        api_mode='anthropic_messages',
+    )
+    snapshot = core.worker_snapshot('oojj_opus48', fallback)
+    assert snapshot['name'] == 'oojj_opus48'
+    assert snapshot['model'] == 'claude-opus-4-8'
+    assert snapshot['api_mode'] == 'anthropic_messages'
+    with pytest.raises(ValueError, match='approved reviewer'):
+        core.worker_snapshot('oojj_opus48', fallback | {'model': 'unknown-model'})
+
+    gpt = approved_worker(model='gpt-5.6-sol')
+    assert core.worker_snapshot('tool102345_gpt56', gpt)['model'] == 'gpt-5.6-sol'
 
 
 def test_http_error_never_includes_provider_body(monkeypatch):
@@ -103,7 +119,7 @@ def test_blocking_finding_references_must_exist_in_index(tmp_path):
 
 def test_public_plugin_errors_are_classified_not_echoed(monkeypatch):
     from hermes_code_review import plugin
-    monkeypatch.setattr(plugin, '_route', lambda: (_ for _ in ()).throw(RuntimeError('Bearer super-secret')))
+    monkeypatch.setattr(plugin, '_routes', lambda: (_ for _ in ()).throw(RuntimeError('Bearer super-secret')))
     payload = json.loads(plugin.review_git_candidate({'repo': '/tmp/nope'}))
     assert payload == {'status': 'INFRA_FAILED', 'error_class': 'PRIVACY'}
     assert 'secret' not in json.dumps(payload).lower()

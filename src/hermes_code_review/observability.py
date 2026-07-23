@@ -37,10 +37,10 @@ def classify_error(message: str) -> str:
         return 'NO_ACCOUNT'
     if 'timeout' in text or 'timed out' in text:
         return 'TIMEOUT'
-    if 'verdict' in text or 'json' in text:
-        return 'INVALID_VERDICT'
     if 'stale' in text:
         return 'STALE'
+    if 'verdict' in text:
+        return 'INVALID_VERDICT'
     if 'circuit open' in text:
         return 'CIRCUIT_OPEN'
     if 'budget' in text:

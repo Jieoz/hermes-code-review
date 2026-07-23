@@ -31,6 +31,7 @@ def test_plugin_registers_first_class_review_tools():
     assert set(by_name) == {'review_git_candidate', 'code_review_status'}
     assert by_name['review_git_candidate']['toolset'] == 'code_review'
     assert by_name['review_git_candidate']['schema']['parameters']['required'] == ['repo']
+    assert by_name['review_git_candidate']['schema']['parameters']['properties']['release_gate']['type'] == 'boolean'
     assert by_name['review_git_candidate'].get('override') is not True
 
 
@@ -120,5 +121,5 @@ main_token_reserve:
     payload = json.loads(result.stdout)
     assert result.returncode == 0
     assert payload['status'] == 'READY'
-    assert payload['version'] == '0.1.2'
+    assert payload['version'] == '0.2.0'
     assert payload['fallback'] == 'fail'

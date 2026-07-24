@@ -121,5 +121,5 @@ main_token_reserve:
     payload = json.loads(result.stdout)
     assert result.returncode == 0
     assert payload['status'] == 'READY'
-    assert payload['version'] == '0.2.0'
+    assert payload['version'] == '0.2.1'
     assert payload['fallback'] == 'fail'

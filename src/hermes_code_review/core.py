@@ -124,6 +124,28 @@ def worker_snapshot(name: str, worker: dict) -> dict:
     if not credential:
         raise ValueError(f'review worker has no usable credential: {name}')
     extra_headers = dict(worker.get('extra_headers') or {})
+    # Some relays flow-control the OpenAI `response_format: json_object` capability
+    # for low-throughput account groups (observed: hybgzs returns HTTP 403
+    # "Flow control limitations in low-throughput groups"). Such a route can still
+    # produce a strict JSON verdict when driven purely by the prompt contract, so
+    # allow disabling the API-level JSON mode per route. This is a transport detail,
+    # not a reviewer-identity change: the strict verdict parser stays fail-closed,
+    # so it is deliberately excluded from route_sha.
+    json_mode = worker.get('review_json_mode')
+    json_mode = True if json_mode is None else bool(json_mode)
+    # Per-route retry shaping. Some relays (observed: hybgzs grok-4.5) have small,
+    # intermittently-exhausted upstream channel pools that return HTTP 503
+    # "no available channels" or time out after a couple of back-to-back calls,
+    # then recover a few tens of seconds later. A route can be driven through such
+    # windows with more attempts and a longer backoff cap. Transport detail, not
+    # reviewer identity -> excluded from route_sha. Defaults preserve prior behavior.
+    # review_max_attempts is a per-route FLOOR on attempt count (default 1 = no
+    # floor, so the caller's attempts value governs). A relay with an
+    # intermittently-exhausted upstream can raise it (grok-4.5 -> 6).
+    max_attempts = worker.get('review_max_attempts')
+    max_attempts = 1 if max_attempts is None else max(1, int(max_attempts))
+    backoff_cap = worker.get('review_backoff_cap_seconds')
+    backoff_cap = 8.0 if backoff_cap is None else max(1.0, float(backoff_cap))
     public = {'name': name, 'model': str(worker['model']), 'api_mode': mode}
     # Route identity is deliberately non-secret. Credential rotation does not
     # change the logical reviewer route and secret-derived fingerprints must not
@@ -131,7 +153,9 @@ def worker_snapshot(name: str, worker: dict) -> dict:
     endpoint_identity = f'{parsed.scheme}://{parsed.netloc}{parsed.path.rstrip("/")}'
     integrity = {**public, 'endpoint_identity': endpoint_identity}
     public['route_sha'] = hashlib.sha256(json.dumps(integrity, sort_keys=True).encode()).hexdigest()
-    return {**public, 'endpoint': endpoint, 'credential': credential, 'extra_headers': extra_headers}
+    return {**public, 'endpoint': endpoint, 'credential': credential,
+            'extra_headers': extra_headers, 'json_mode': json_mode,
+            'max_attempts': max_attempts, 'backoff_cap': backoff_cap}
 
 
 def public_route(snapshot: dict) -> dict:
@@ -139,11 +163,56 @@ def public_route(snapshot: dict) -> dict:
     return {key: snapshot[key] for key in ('name', 'model', 'api_mode', 'route_sha')}
 
 
-def parse_strict_verdict(raw: str, receipt: dict) -> dict:
-    if raw != raw.strip() or not raw.startswith('{') or not raw.endswith('}'):
+def _extract_json_object(raw: str) -> str:
+    """Best-effort recovery of a single bare JSON object from model output that
+    was NOT constrained by API-level json mode. Strips a leading/trailing markdown
+    code fence and returns the first balanced brace span. This only reshapes the
+    candidate text; the extracted value must still pass the full strict
+    validate_verdict schema check, so recovery never weakens the fail-closed gate."""
+    text = raw.strip()
+    if text.startswith('```'):
+        # drop opening fence line (``` or ```json) and any trailing fence
+        nl = text.find('\n')
+        if nl != -1:
+            text = text[nl + 1:]
+        if text.rstrip().endswith('```'):
+            text = text.rstrip()[:-3]
+        text = text.strip()
+    start = text.find('{')
+    if start == -1:
+        return text
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text
+
+
+def parse_strict_verdict(raw: str, receipt: dict, *, allow_recovery: bool = False) -> dict:
+    candidate = raw
+    if allow_recovery and (raw != raw.strip() or not raw.strip().startswith('{') or not raw.strip().endswith('}')):
+        candidate = _extract_json_object(raw)
+    if candidate != candidate.strip() or not candidate.startswith('{') or not candidate.endswith('}'):
         raise ValueError('review response is not a bare JSON object')
     try:
-        value = json.loads(raw)
+        value = json.loads(candidate)
     except json.JSONDecodeError as exc:
         raise ValueError(f'review response is invalid JSON: {exc}') from exc
     return validate_verdict(value, receipt)
@@ -292,7 +361,7 @@ def _request_json(snapshot: dict, body: dict, timeout: int) -> dict:
 
 def _review_body(snapshot: dict, prompt: str, max_output_tokens: int) -> dict:
     body = {'model': snapshot['model'], 'max_tokens': max_output_tokens, 'temperature': 0, 'messages': [{'role': 'user', 'content': prompt}]}
-    if snapshot['api_mode'] == 'chat_completions':
+    if snapshot['api_mode'] == 'chat_completions' and snapshot.get('json_mode', True):
         body['response_format'] = {'type': 'json_object'}
     return body
 
@@ -390,7 +459,15 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
     transport = transport or _request_json
     started = time.monotonic()
     total_input_tokens = total_output_tokens = 0
-    attempts = max(1, attempts)
+    # The route may require more attempts / longer backoff to ride through an
+    # intermittently-exhausted upstream (e.g. hybgzs grok-4.5 "no available
+    # channels" 503s). Honor it as a floor over the caller's default.
+    attempts = max(1, attempts, int(snapshot.get('max_attempts', 1)))
+    backoff_cap = float(snapshot.get('backoff_cap', 8.0))
+    # A route configured for many retries must not trip its own circuit purely on
+    # within-run sub-attempt failures; only sustained failure beyond a full attempt
+    # cycle should open it. Keep the default (3) for normal 2-attempt routes.
+    circuit_threshold = max(3, attempts + 1)
     verdict = None
 
     def strict_usage_value(usage: dict, primary: str, alias: str) -> int:
@@ -433,7 +510,7 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
             input_tokens = strict_usage_value(usage, 'input_tokens', 'prompt_tokens')
             output_tokens = strict_usage_value(usage, 'output_tokens', 'completion_tokens')
             usage_known = True
-            verdict = parse_strict_verdict(raw, receipt)
+            verdict = parse_strict_verdict(raw, receipt, allow_recovery=not snapshot.get('json_mode', True))
         except ReviewHTTPError as exc:
             if budget_path is not None and reservation is not None:
                 policy.reconcile_budget(
@@ -444,10 +521,10 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
             total_output_tokens += max_output_tokens
             if not retryable_status(exc.status):
                 raise
-            record_failure(state_path, route_sha)
+            record_failure(state_path, route_sha, threshold=circuit_threshold)
             if attempt >= attempts:
                 raise
-            sleep(min(8.0, (2 ** (attempt - 1)) + random.random()))
+            sleep(min(backoff_cap, (2 ** (attempt - 1)) + random.random()))
             continue
         except (urllib.error.URLError, TimeoutError, OSError):
             if budget_path is not None and reservation is not None:
@@ -457,10 +534,10 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
                 )
             total_input_tokens += estimated_tokens
             total_output_tokens += max_output_tokens
-            record_failure(state_path, route_sha)
+            record_failure(state_path, route_sha, threshold=circuit_threshold)
             if attempt >= attempts:
                 raise ReviewTransportError('network transport failed') from None
-            sleep(min(8.0, (2 ** (attempt - 1)) + random.random()))
+            sleep(min(backoff_cap, (2 ** (attempt - 1)) + random.random()))
             continue
         except (ValueError, TypeError, KeyError):
             charged_input = input_tokens if usage_known else estimated_tokens
@@ -472,10 +549,10 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
                 )
             total_input_tokens += charged_input
             total_output_tokens += charged_output
-            record_failure(state_path, route_sha)
+            record_failure(state_path, route_sha, threshold=circuit_threshold)
             if attempt >= attempts:
                 raise InvalidVerdictError('invalid review verdict') from None
-            sleep(min(8.0, (2 ** (attempt - 1)) + random.random()))
+            sleep(min(backoff_cap, (2 ** (attempt - 1)) + random.random()))
             continue
 
         if budget_path is not None and reservation is not None:

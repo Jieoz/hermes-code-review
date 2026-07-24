@@ -90,6 +90,24 @@ code_review:
   max_output_tokens: 8192
 ```
 
+Per-route transport knobs (not part of reviewer identity / `route_sha`) may be set
+on a worker when a relay needs special handling:
+
+```yaml
+hybgzs_grok45:
+  model: grok-4.5
+  api_mode: chat_completions
+  review_json_mode: false          # omit API response_format; prompt still requires strict JSON
+  review_max_attempts: 6           # floor on same-route retries for intermittent 503/timeouts
+  review_backoff_cap_seconds: 20   # longer backoff while riding through exhausted channels
+```
+
+- `review_json_mode: false` still fail-closes on invalid verdicts; it only allows a
+  best-effort bare-JSON recovery (strip markdown fences / leading whitespace) before
+  the strict schema check.
+- Higher `review_max_attempts` scales the local circuit threshold so a single request
+  cannot open its own circuit purely by using its configured retries.
+
 `max_input_tokens` and `max_output_tokens` are per-request payload bounds, not
 daily quotas. Optional operator-defined daily caps remain supported only when
 explicitly configured; zero or omitted daily limits mean unlimited.

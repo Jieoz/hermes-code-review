@@ -43,6 +43,13 @@ same-route invalid-verdict retry). A valid `BLOCKED`, privacy failure, budget
 failure, policy failure, or stale candidate is final and cannot select another
 reviewer. Fallback therefore improves availability without shopping for a PASS.
 
+Per-route transport knobs (`review_json_mode`, `review_max_attempts`,
+`review_backoff_cap_seconds`) shape request body construction and same-route retry
+timing without changing reviewer identity. They are excluded from `route_sha`.
+When JSON mode is disabled, response recovery may extract a bare JSON object from
+fenced/padded text, but the extracted value still must pass the full strict
+verdict schema.
+
 There is no self-imposed daily input/output cap by default. The ledger retains
 usage attribution for observability, while provider/account limits remain
 authoritative. Optional operator-defined daily caps are supported only when

@@ -246,19 +246,13 @@ def _local_status_payload() -> dict:
     release_reserve = _nonnegative_setting(settings, "release_input_reserve")
     route_rows = []
     for name, _worker, snapshot in routes:
-        try:
-            core.assert_circuit_closed(core.STATE, snapshot["route_sha"])
-            route_status = "READY"
-        except RuntimeError as exc:
-            if "circuit open" not in str(exc).lower():
-                raise
-            route_status = "CIRCUIT_OPEN"
-        route_rows.append({
+        circuit = core.circuit_state(core.STATE, snapshot["route_sha"])
+        row = {
             "worker": name,
             "model": snapshot["model"],
             "api_mode": snapshot["api_mode"],
             "route_sha": snapshot["route_sha"],
-            "status": route_status,
+            "status": circuit["status"],
             "budget": policy.budget_status(
                 core.BUDGET,
                 route_sha=snapshot["route_sha"],
@@ -266,11 +260,34 @@ def _local_status_payload() -> dict:
                 daily_output_limit=daily_output,
                 release_input_reserve=release_reserve,
             ),
-        })
-    if not any(row["status"] == "READY" for row in route_rows):
-        raise RuntimeError("review worker circuit open")
+        }
+        if circuit["status"] == "CIRCUIT_OPEN":
+            row["open_until"] = circuit["open_until"]
+            row["retry_after_seconds"] = circuit["retry_after_seconds"]
+        route_rows.append(row)
     primary = route_rows[0]
     fallbacks = route_rows[1:]
+    any_ready = any(row["status"] == "READY" for row in route_rows)
+    if not any_ready:
+        # Every route's circuit is open. Do NOT collapse to an opaque failure:
+        # stay truthful so the caller sees each route identity, budget, and —
+        # critically — the earliest cooldown lapse, so a spaced retry can be
+        # scheduled instead of blind polling. A reviewer infra outage must not
+        # blind the operator to when it clears.
+        soonest = min(row["retry_after_seconds"] for row in route_rows)
+        return {
+            "status": "ALL_ROUTES_UNAVAILABLE",
+            "version": __version__,
+            "worker": primary["worker"],
+            "model": primary["model"],
+            "api_mode": primary["api_mode"],
+            "route_sha": primary["route_sha"],
+            "primary_status": primary["status"],
+            "fallback": "preapproved_infra_only" if fallbacks else "fail",
+            "fallback_workers": fallbacks,
+            "budget": primary["budget"],
+            "retry_after_seconds": soonest,
+        }
     return {
         "status": "READY",
         "version": __version__,

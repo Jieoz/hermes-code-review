@@ -295,6 +295,28 @@ def assert_circuit_closed(path: Path, route_sha: str, *, now: float | None = Non
         raise CircuitOpenError(f'review worker circuit open until {row["open_until"]}')
 
 
+def circuit_state(path: Path, route_sha: str, *, now: float | None = None) -> dict:
+    """Read circuit health for a route without raising.
+
+    Returns the closed/open disposition plus, when open, the absolute
+    ``open_until`` epoch and the non-negative ``retry_after_seconds`` until the
+    cooldown lapses. This lets the status tool stay truthful (and tell a caller
+    *when* to retry) even when every route is open, instead of collapsing to an
+    opaque failure.
+    """
+    now = time.time() if now is None else now
+    row = (_read_state(path).get(route_sha) or {})
+    open_until = float(row.get('open_until') or 0)
+    if open_until > now:
+        return {
+            'status': 'CIRCUIT_OPEN',
+            'open_until': open_until,
+            'retry_after_seconds': max(0, int(open_until - now + 0.999)),
+        }
+    return {'status': 'READY', 'open_until': 0, 'retry_after_seconds': 0}
+
+
+
 def record_failure(path: Path, route_sha: str, *, threshold: int = 3, cooldown: int = 300, now: float | None = None) -> None:
     now = time.time() if now is None else now
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -510,7 +532,10 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
             input_tokens = strict_usage_value(usage, 'input_tokens', 'prompt_tokens')
             output_tokens = strict_usage_value(usage, 'output_tokens', 'completion_tokens')
             usage_known = True
-            verdict = parse_strict_verdict(raw, receipt, allow_recovery=not snapshot.get('json_mode', True))
+            # Always allow recovery reshaping (fence / leading prose). Schema validation
+            # remains fail-closed, so this only recovers transport-shape noise from
+            # chat and messages APIs — never a soft PASS.
+            verdict = parse_strict_verdict(raw, receipt, allow_recovery=True)
         except ReviewHTTPError as exc:
             if budget_path is not None and reservation is not None:
                 policy.reconcile_budget(
@@ -678,7 +703,10 @@ def _aggregate_chunk_results(frozen: dict, results: list[dict], *,
     for row in results:
         for key in combined:
             combined[key].extend(row['verdict'][key])
-    passed = all(row['verdict']['passed'] is True for row in results) and not any(combined.values())
+    # Blocking findings are p0/p1/needs_evidence/security_concerns. P2 notes are
+    # non-blocking and must not fail an otherwise-green segmented review.
+    blocking_keys = ('p0', 'p1', 'needs_evidence', 'security_concerns')
+    passed = all(row['verdict']['passed'] is True for row in results) and not any(combined[k] for k in blocking_keys)
     safe = passed and all(row['verdict']['safe_to_commit'] is True for row in results)
     verdict = {
         'passed': passed,
@@ -857,6 +885,7 @@ def validate_verdict(verdict: dict, receipt: dict) -> dict:
     if any(verdict[k] != receipt[k] for k in receipt_fields):
         raise ValueError('stale review verdict snapshot')
     blocking = bool(verdict['p0'] or verdict['p1'] or verdict['needs_evidence'] or verdict['security_concerns'])
+    # P2 are non-blocking notes: they must never make a verdict inconsistent.
     if verdict['passed'] != (not blocking) or verdict['safe_to_commit'] != verdict['passed']:
         raise ValueError('inconsistent review verdict')
     return verdict

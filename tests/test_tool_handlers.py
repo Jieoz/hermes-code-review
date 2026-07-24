@@ -413,9 +413,19 @@ def test_status_tool_uses_ready_fallback_when_primary_circuit_is_open(monkeypatc
     assert value['fallback_workers'][0]['status'] == 'READY'
 
 
-def test_status_tool_fails_closed_when_reviewer_circuit_is_open(monkeypatch, tmp_path):
-    from hermes_code_review import core, plugin
+def test_status_tool_stays_truthful_when_all_routes_circuit_open(monkeypatch, tmp_path):
+    """All-routes-open must NOT collapse to an opaque failure.
+
+    Regression: the status tool used to raise and return a bare
+    {status: INFRA_FAILED, error_class: CIRCUIT_OPEN}, discarding route
+    identities, budgets, and — critically — when the cooldown lapses. That
+    blinded the operator to *when* to retry and invited retry-storms. The tool
+    must instead report ALL_ROUTES_UNAVAILABLE with per-route status and the
+    soonest retry_after_seconds.
+    """
+    from hermes_code_review import __version__, core, plugin
     monkeypatch.setattr(plugin.core, 'STATE', tmp_path / 'health.json')
+    monkeypatch.setattr(plugin.core, 'BUDGET', tmp_path / 'budget.json')
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
         'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
         'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
@@ -430,7 +440,13 @@ def test_status_tool_fails_closed_when_reviewer_circuit_is_open(monkeypatch, tmp
 
     value = json.loads(plugin.code_review_status({}))
 
-    assert value == {'status': 'INFRA_FAILED', 'error_class': 'CIRCUIT_OPEN'}
+    assert value['status'] == 'ALL_ROUTES_UNAVAILABLE'
+    assert value['primary_status'] == 'CIRCUIT_OPEN'
+    assert value['worker'] == 'hybgzs_grok45'
+    assert value['version'] == __version__
+    # Truthful cooldown: 300s cooldown opened at t=100, now t=101 -> ~299s left.
+    assert value['retry_after_seconds'] == 299
+    assert 'budget' in value
 
 
 def test_status_tool_sanitizes_route_failures_and_never_probes_network(monkeypatch):

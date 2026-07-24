@@ -106,3 +106,23 @@ def test_circuit_failure_updates_are_atomic(tmp_path):
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(lambda _: core.record_failure(state, 'route', threshold=1000), range(30)))
     assert json.loads(state.read_text())['route']['failures'] == 30
+
+
+def test_circuit_state_reports_retry_after_without_raising(tmp_path):
+    """circuit_state must expose open_until + retry_after_seconds instead of raising,
+    so the status tool can tell a caller WHEN a route reopens (no blind polling)."""
+    from hermes_code_review import core
+    state = tmp_path / 'health.json'
+    # Closed route: READY, zero wait.
+    closed = core.circuit_state(state, 'route', now=100)
+    assert closed == {'status': 'READY', 'open_until': 0, 'retry_after_seconds': 0}
+    # Trip it: 300s cooldown opened at t=100.
+    core.record_failure(state, 'route', threshold=1, cooldown=300, now=100)
+    opened = core.circuit_state(state, 'route', now=101)
+    assert opened['status'] == 'CIRCUIT_OPEN'
+    assert opened['open_until'] == 400
+    assert opened['retry_after_seconds'] == 299  # rounds up remaining wait
+    # After cooldown lapses it reads READY again without any success write.
+    lapsed = core.circuit_state(state, 'route', now=401)
+    assert lapsed['status'] == 'READY'
+    assert lapsed['retry_after_seconds'] == 0

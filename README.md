@@ -144,6 +144,14 @@ route, credential-file contract, circuit state, and observed usage without
 spending a reviewer request. Only a substantive candidate review proves end-to-end
 reviewer service.
 
+When **every** route's local circuit is open, `status` does not collapse to an
+opaque failure. It returns `status: ALL_ROUTES_UNAVAILABLE` with each route's
+identity, budget, per-route `open_until`, and a top-level `retry_after_seconds`
+giving the soonest cooldown lapse. This lets the caller schedule a single spaced
+retry instead of blind-polling — a reviewer infrastructure outage must never
+blind the operator to *when* it clears, and never justifies a retry-storm against
+an unchanged candidate.
+
 The fallback is attempted only after retryable transport/server/rate-limit/circuit
 failure, or after one same-route retry still produces an invalid strict verdict.
 Privacy, budget, policy, stale-candidate, and valid `BLOCKED` outcomes never trigger

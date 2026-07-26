@@ -159,18 +159,23 @@ def _global_usage(value: dict) -> tuple[int, int]:
 
 def budget_status(path: Path, *, route_sha: str, daily_input_limit: int,
                   daily_output_limit: int, release_input_reserve: int = 0,
+                  release_output_reserve: int = 0,
                   now: float | None = None) -> dict:
     now = time.time() if now is None else now
-    if min(daily_input_limit, daily_output_limit, release_input_reserve) < 0:
+    if min(daily_input_limit, daily_output_limit, release_input_reserve,
+           release_output_reserve) < 0:
         raise PolicyViolation('review budget limits cannot be negative')
     if daily_input_limit > 0 and release_input_reserve > daily_input_limit:
         raise PolicyViolation('release input reserve exceeds daily input limit')
+    if daily_output_limit > 0 and release_output_reserve > daily_output_limit:
+        raise PolicyViolation('release output reserve exceeds daily output limit')
     value = _load(path, _day(now))
     input_used, output_used = _global_usage(value)
     input_unlimited = daily_input_limit == 0
     output_unlimited = daily_output_limit == 0
     input_remaining = None if input_unlimited else max(0, daily_input_limit - input_used)
     effective_reserve = 0 if input_unlimited else release_input_reserve
+    effective_output_reserve = 0 if output_unlimited else release_output_reserve
     routine_input_remaining = (
         None if input_unlimited
         else max(0, daily_input_limit - input_used - effective_reserve)
@@ -184,6 +189,11 @@ def budget_status(path: Path, *, route_sha: str, daily_input_limit: int,
         'release_input_reserve': effective_reserve,
         'output_used': output_used,
         'output_remaining': None if output_unlimited else max(0, daily_output_limit - output_used),
+        'routine_output_remaining': (
+            None if output_unlimited
+            else max(0, daily_output_limit - output_used - effective_output_reserve)
+        ),
+        'release_output_reserve': effective_output_reserve,
         'reset_at': None if input_unlimited and output_unlimited else time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(reset_epoch)),
     }
 
@@ -191,15 +201,19 @@ def budget_status(path: Path, *, route_sha: str, daily_input_limit: int,
 def reserve_budget(path: Path, *, route_sha: str, estimated_input_tokens: int,
                    estimated_output_tokens: int, daily_input_limit: int,
                    daily_output_limit: int, release_input_reserve: int = 0,
+                   release_output_reserve: int = 0,
                    allow_release_reserve: bool = False,
                    now: float | None = None) -> str:
     now = time.time() if now is None else now
     if min(estimated_input_tokens, estimated_output_tokens) <= 0:
         raise PolicyViolation('review token estimates must be positive')
-    if min(daily_input_limit, daily_output_limit, release_input_reserve) < 0:
+    if min(daily_input_limit, daily_output_limit, release_input_reserve,
+           release_output_reserve) < 0:
         raise PolicyViolation('review budget limits cannot be negative')
     if daily_input_limit > 0 and release_input_reserve > daily_input_limit:
         raise PolicyViolation('release input reserve exceeds daily input limit')
+    if daily_output_limit > 0 and release_output_reserve > daily_output_limit:
+        raise PolicyViolation('release output reserve exceeds daily output limit')
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(f'.{path.name}.lock')
     with exclusive_lock(lock_path) as lock:
@@ -208,13 +222,17 @@ def reserve_budget(path: Path, *, route_sha: str, estimated_input_tokens: int,
         row = dict(value['routes'].get(route_sha) or {})
         used_input, used_output = _global_usage(value)
         available_input_limit = daily_input_limit if allow_release_reserve else daily_input_limit - release_input_reserve
+        available_output_limit = daily_output_limit if allow_release_reserve else daily_output_limit - release_output_reserve
         if daily_input_limit > 0 and used_input + estimated_input_tokens > available_input_limit:
             detail = 'daily review input budget exhausted'
             if not allow_release_reserve and release_input_reserve:
                 detail = 'daily review input budget reached protected release reserve'
             raise PolicyViolation(detail)
-        if daily_output_limit > 0 and used_output + estimated_output_tokens > daily_output_limit:
-            raise PolicyViolation('daily review output budget exhausted')
+        if daily_output_limit > 0 and used_output + estimated_output_tokens > available_output_limit:
+            detail = 'daily review output budget exhausted'
+            if not allow_release_reserve and release_output_reserve:
+                detail = 'daily review output budget reached protected release reserve'
+            raise PolicyViolation(detail)
         reservation = uuid.uuid4().hex
         row['reserved_input_tokens'] = int(row.get('reserved_input_tokens') or 0) + estimated_input_tokens
         row['reserved_output_tokens'] = int(row.get('reserved_output_tokens') or 0) + estimated_output_tokens

@@ -20,6 +20,11 @@ REVIEW_SCHEMA = {
             "requirements": {"type": "string", "description": "Acceptance criteria."},
             "evidence": {"type": "string", "description": "Deterministic test/static evidence to scrutinize."},
             "release_gate": {"type": "boolean", "description": "Allow this final tag, release, or deployment review to consume the protected release budget reserve."},
+            "gate_role": {
+                "type": "string",
+                "enum": ["load_bearing", "secondary"],
+                "description": "Whether reviewer infrastructure failure blocks handoff. Concrete findings always block.",
+            },
         },
         "required": ["repo"],
     },
@@ -46,12 +51,28 @@ def _routes() -> tuple[list[tuple[str, dict[str, Any], dict[str, Any]]], dict[st
         or len(names) != len(set(names))
     ):
         raise RuntimeError("code-review workers must be a non-empty list of unique worker names")
+    author_families = settings.get("author_model_families")
+    if (
+        not isinstance(author_families, list)
+        or not author_families
+        or not all(isinstance(value, str) and value.strip() for value in author_families)
+    ):
+        raise RuntimeError("code_review.author_model_families must be a non-empty list")
+    author_families = {value.strip().lower() for value in author_families}
     routes = []
+    reviewer_families: set[str] = set()
     for name in names:
         worker = workers.get(name)
         if not isinstance(worker, dict):
             raise RuntimeError("configured code-review route is not preapproved")
-        routes.append((name, worker, core.worker_snapshot(name, worker)))
+        snapshot = core.worker_snapshot(name, worker)
+        family = core.model_family(snapshot["model"])
+        if family in author_families:
+            raise RuntimeError("review route uses an author model family")
+        if family in reviewer_families:
+            raise RuntimeError("review routes must use distinct model families")
+        reviewer_families.add(family)
+        routes.append((name, worker, snapshot))
     return routes, cfg
 
 
@@ -100,6 +121,13 @@ def _fallback_eligible(exc: Exception) -> bool:
     return isinstance(exc, core.CircuitOpenError)
 
 
+def _gate_role(args: dict[str, Any]) -> str:
+    value = str(args.get("gate_role") or "load_bearing")
+    if value not in {"load_bearing", "secondary"}:
+        raise RuntimeError("gate_role must be load_bearing or secondary")
+    return value
+
+
 def _positive_setting(settings: dict[str, Any], key: str, default: int) -> int:
     value = default if key not in settings else settings[key]
     if isinstance(value, bool) or not isinstance(value, int):
@@ -122,7 +150,7 @@ def _public_result(result: dict[str, Any], snapshot: dict[str, Any]) -> dict[str
         "review_route_sha", "reviewer_model", "review_requirements_sha",
         "review_evidence_sha",
     )
-    metric_keys = ("attempts", "elapsed_ms", "input_tokens", "output_tokens", "chunk_count")
+    metric_keys = ("attempts", "elapsed_ms", "input_tokens", "output_tokens")
     receipt = result.get("receipt") or {}
     metrics = result.get("metrics") or {}
     signature = result.get("signature") or {}
@@ -145,7 +173,9 @@ def review_git_candidate(args: dict, **_: Any) -> str:
     worker_name = ""
     model = ""
     route_sha = ""
+    gate_role = "load_bearing"
     try:
+        gate_role = _gate_role(args)
         routes, cfg = _routes()
         expected_pool = _pool_identity(routes)
         settings = cfg.get("code_review") or {}
@@ -170,10 +200,11 @@ def review_git_candidate(args: dict, **_: Any) -> str:
                     current_worker=lambda route_name=name: _current_pool_worker(expected_pool, route_name),
                     budget_path=core.BUDGET,
                     max_input_tokens=_positive_setting(settings, "max_input_tokens", 120_000),
-                    daily_input_tokens=_nonnegative_setting(settings, "daily_input_tokens"),
+                    daily_input_tokens=_nonnegative_setting(settings, "daily_input_tokens", 1_000_000),
                     max_output_tokens=_positive_setting(settings, "max_output_tokens", 8_192),
-                    daily_output_tokens=_nonnegative_setting(settings, "daily_output_tokens"),
-                    release_input_reserve=_nonnegative_setting(settings, "release_input_reserve"),
+                    daily_output_tokens=_nonnegative_setting(settings, "daily_output_tokens", 200_000),
+                    release_input_reserve=_nonnegative_setting(settings, "release_input_reserve", 200_000),
+                    release_output_reserve=_nonnegative_setting(settings, "release_output_reserve", 40_000),
                     allow_release_reserve=args.get("release_gate") is True,
                     signing_key_path=SIGNING_KEY,
                     max_source_bytes=_positive_setting(settings, "max_source_bytes", 350_000),
@@ -213,6 +244,9 @@ def review_git_candidate(args: dict, **_: Any) -> str:
         public["status"] = status
         public["fallback_used"] = route_index > 0
         public["reused"] = result.get("reused") is True
+        if "gate_role" in args:
+            public["gate_role"] = gate_role
+            public["blocks_handoff"] = status == "BLOCKED"
         route_sha = str((result.get("route") or {}).get("route_sha") or "")
         metrics = result.get("metrics") or {}
         reused = result.get("reused") is True
@@ -234,16 +268,26 @@ def review_git_candidate(args: dict, **_: Any) -> str:
             )
         except Exception:
             pass
-        return json.dumps({"status": "INFRA_FAILED", "error_class": _error_class(exc)}, ensure_ascii=False, sort_keys=True)
+        payload: dict[str, Any] = {
+            "status": "INFRA_FAILED",
+            "error_class": _error_class(exc),
+        }
+        if "gate_role" in args:
+            payload["gate_role"] = gate_role
+            payload["blocks_handoff"] = not (
+                gate_role == "secondary" and _fallback_eligible(exc)
+            )
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def _local_status_payload() -> dict:
     """Validate preapproved local routes without making a reviewer request."""
     routes, cfg = _routes()
     settings = cfg.get("code_review") or {}
-    daily_input = _nonnegative_setting(settings, "daily_input_tokens")
-    daily_output = _nonnegative_setting(settings, "daily_output_tokens")
-    release_reserve = _nonnegative_setting(settings, "release_input_reserve")
+    daily_input = _nonnegative_setting(settings, "daily_input_tokens", 1_000_000)
+    daily_output = _nonnegative_setting(settings, "daily_output_tokens", 200_000)
+    release_reserve = _nonnegative_setting(settings, "release_input_reserve", 200_000)
+    release_output_reserve = _nonnegative_setting(settings, "release_output_reserve", 40_000)
     route_rows = []
     for name, _worker, snapshot in routes:
         circuit = core.circuit_state(core.STATE, snapshot["route_sha"])
@@ -259,6 +303,7 @@ def _local_status_payload() -> dict:
                 daily_input_limit=daily_input,
                 daily_output_limit=daily_output,
                 release_input_reserve=release_reserve,
+                release_output_reserve=release_output_reserve,
             ),
         }
         if circuit["status"] == "CIRCUIT_OPEN":

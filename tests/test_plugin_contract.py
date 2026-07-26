@@ -78,6 +78,8 @@ delegation:
   lanes:
     critic:
       worker: hybgzs_grok45
+code_review:
+  author_model_families: [gpt]
 main_token_reserve:
   workers:
     hybgzs_grok45:
@@ -121,5 +123,5 @@ main_token_reserve:
     payload = json.loads(result.stdout)
     assert result.returncode == 0
     assert payload['status'] == 'READY'
-    assert payload['version'] == '0.2.2'
+    assert payload['version'] == '0.3.0'
     assert payload['fallback'] == 'fail'

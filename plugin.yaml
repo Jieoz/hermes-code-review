@@ -1,6 +1,6 @@
 name: hermes-code-review
-version: 0.2.2
-description: Fail-closed immutable Git review with fixed, preapproved primary and infrastructure-fallback identities.
+version: 0.3.0
+description: Full-context immutable Git review with enforced cross-family independence and project-aware gate seniority.
 provides_tools:
   - review_git_candidate
   - code_review_status

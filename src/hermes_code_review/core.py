@@ -35,15 +35,21 @@ RESERVE_KEY_DIR = HERMES_HOME / 'secrets/reserve_keys'
 APPROVED_WORKER = 'hybgzs_grok45'
 APPROVED_MODEL = 'grok-4.5'
 APPROVED_API_MODE = 'chat_completions'
-APPROVED_REVIEWERS = {
-    APPROVED_WORKER: {'model': APPROVED_MODEL, 'api_mode': APPROVED_API_MODE},
-    'cc_review_route': {'model': 'claude-opus-4-8', 'api_mode': 'anthropic_messages'},
-}
 APPROVED_REVIEWER_IDENTITIES = {
     ('gpt-5.6-sol', 'chat_completions'),
     ('claude-opus-4-8', 'anthropic_messages'),
     ('grok-4.5', 'chat_completions'),
+    ('kimi-k3', 'chat_completions'),
 }
+
+
+def model_family(model: str) -> str:
+    """Return the explicit cognitive model family used for independence checks."""
+    value = str(model or '').strip().lower()
+    for family in ('gpt', 'claude', 'grok', 'kimi'):
+        if value.startswith(family + '-') or value == family:
+            return family
+    raise ValueError(f'unsupported reviewer model family: {model}')
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
@@ -133,6 +139,13 @@ def worker_snapshot(name: str, worker: dict) -> dict:
     # so it is deliberately excluded from route_sha.
     json_mode = worker.get('review_json_mode')
     json_mode = True if json_mode is None else bool(json_mode)
+    temperature = worker['review_temperature'] if 'review_temperature' in worker else 0
+    temperature = None if temperature is None else float(temperature)
+    reasoning_effort = worker.get('review_reasoning_effort')
+    if reasoning_effort is not None:
+        reasoning_effort = str(reasoning_effort).strip().lower()
+        if reasoning_effort not in {'low', 'high', 'max'}:
+            raise ValueError('review_reasoning_effort must be low, high, or max')
     # Per-route retry shaping. Some relays (observed: hybgzs grok-4.5) have small,
     # intermittently-exhausted upstream channel pools that return HTTP 503
     # "no available channels" or time out after a couple of back-to-back calls,
@@ -155,6 +168,8 @@ def worker_snapshot(name: str, worker: dict) -> dict:
     public['route_sha'] = hashlib.sha256(json.dumps(integrity, sort_keys=True).encode()).hexdigest()
     return {**public, 'endpoint': endpoint, 'credential': credential,
             'extra_headers': extra_headers, 'json_mode': json_mode,
+            'temperature': temperature,
+            'reasoning_effort': reasoning_effort,
             'max_attempts': max_attempts, 'backoff_cap': backoff_cap}
 
 
@@ -382,7 +397,12 @@ def _request_json(snapshot: dict, body: dict, timeout: int) -> dict:
 
 
 def _review_body(snapshot: dict, prompt: str, max_output_tokens: int) -> dict:
-    body = {'model': snapshot['model'], 'max_tokens': max_output_tokens, 'temperature': 0, 'messages': [{'role': 'user', 'content': prompt}]}
+    body = {'model': snapshot['model'], 'max_tokens': max_output_tokens,
+            'messages': [{'role': 'user', 'content': prompt}]}
+    if snapshot.get('temperature') is not None:
+        body['temperature'] = snapshot['temperature']
+    if snapshot.get('reasoning_effort') is not None:
+        body['reasoning_effort'] = snapshot['reasoning_effort']
     if snapshot['api_mode'] == 'chat_completions' and snapshot.get('json_mode', True):
         body['response_format'] = {'type': 'json_object'}
     return body
@@ -460,7 +480,8 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
                current_worker=None, persist: bool = True, budget_path: Path | None = None,
                max_input_tokens: int = 120_000, daily_input_tokens: int = 0,
                max_output_tokens: int = 8_192, daily_output_tokens: int = 0,
-               release_input_reserve: int = 0, allow_release_reserve: bool = False,
+               release_input_reserve: int = 0, release_output_reserve: int = 0,
+               allow_release_reserve: bool = False,
                candidate_guard=None) -> dict:
     snapshot = worker_snapshot(name, worker)
     route_sha = snapshot['route_sha']
@@ -514,6 +535,7 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
                 daily_input_limit=daily_input_tokens,
                 daily_output_limit=daily_output_tokens,
                 release_input_reserve=release_input_reserve,
+                release_output_reserve=release_output_reserve,
                 allow_release_reserve=allow_release_reserve,
             )
         try:
@@ -657,89 +679,14 @@ def freeze_git_candidate(repo: Path | str) -> dict:
     return {'repo': repo, 'head': head, 'index_tree': index_tree, 'diff': diff, 'paths': paths}
 
 
-def chunk_staged_diff(repo: Path | str, paths: list[str], *, head: str,
-                      index_tree: str, max_source_bytes: int) -> list[dict]:
-    """Group complete per-file staged diffs without cutting a file in half."""
-    if max_source_bytes <= 0:
-        raise ValueError('max_source_bytes must be positive')
-    repo = Path(repo).resolve()
-    chunks: list[dict] = []
-    current_paths: list[str] = []
-    current_parts: list[bytes] = []
-    current_size = 0
-    for path in paths:
-        part = _git(repo, 'diff', '--binary', head, index_tree, '--', f':(literal){path}').stdout
-        if not part:
-            raise RuntimeError(f'cannot freeze staged diff for path: {path}')
-        if len(part) > max_source_bytes:
-            raise RuntimeError(f'single-file staged diff exceeds review chunk limit: {path}')
-        if current_parts and current_size + len(part) > max_source_bytes:
-            chunks.append({'paths': current_paths, 'diff': b''.join(current_parts)})
-            current_paths, current_parts, current_size = [], [], 0
-        current_paths.append(path)
-        current_parts.append(part)
-        current_size += len(part)
-    if current_parts:
-        chunks.append({'paths': current_paths, 'diff': b''.join(current_parts)})
-    return chunks
-
-
-def _aggregate_chunk_results(frozen: dict, results: list[dict], *,
-                             requirements: str = '', evidence: str = '') -> dict:
-    if not results:
-        raise RuntimeError('segmented review produced no chunk results')
-    first = results[0]
-    route = first['route']
-    route_sha = route['route_sha']
-    model = route['model']
-    if any(row['route'].get('route_sha') != route_sha or row['route'].get('model') != model for row in results):
-        raise RuntimeError('segmented review route identity changed between chunks')
-    receipt = snapshot_receipt_bytes(
-        frozen['diff'], frozen['head'], frozen['index_tree'],
-        route_sha=route_sha, reviewer_model=model,
-        requirements=requirements, evidence=evidence,
-    )
-    combined = {key: [] for key in ('p0', 'p1', 'p2', 'needs_evidence', 'security_concerns')}
-    for row in results:
-        for key in combined:
-            combined[key].extend(row['verdict'][key])
-    # Blocking findings are p0/p1/needs_evidence/security_concerns. P2 notes are
-    # non-blocking and must not fail an otherwise-green segmented review.
-    blocking_keys = ('p0', 'p1', 'needs_evidence', 'security_concerns')
-    passed = all(row['verdict']['passed'] is True for row in results) and not any(combined[k] for k in blocking_keys)
-    safe = passed and all(row['verdict']['safe_to_commit'] is True for row in results)
-    verdict = {
-        'passed': passed,
-        **receipt,
-        **combined,
-        'safe_to_commit': safe,
-        'summary': f"Segmented review completed across {len(results)} immutable file-boundary chunks; "
-                   + ('all chunks passed.' if safe else 'one or more chunks blocked.'),
-    }
-    validate_verdict(verdict, receipt)
-    metrics = {
-        'attempts': sum(int(row['metrics'].get('attempts') or 0) for row in results),
-        'elapsed_ms': sum(int(row['metrics'].get('elapsed_ms') or 0) for row in results),
-        'input_tokens': sum(int(row['metrics'].get('input_tokens') or 0) for row in results),
-        'output_tokens': sum(int(row['metrics'].get('output_tokens') or 0) for row in results),
-        'chunk_count': len(results),
-    }
-    return {
-        'verdict': verdict,
-        'receipt': receipt,
-        'route': route,
-        'metrics': metrics,
-        'chunk_receipts': [row['receipt'] for row in results],
-    }
-
-
 def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: str = '',
                    evidence: str = '', attempts: int = 1, timeout: int = 240,
                    state_path: Path = STATE, runs_dir: Path = RUNS, current_worker=None,
                    runner=run_review, budget_path: Path | None = None,
                    max_input_tokens: int = 120_000, daily_input_tokens: int = 0,
                    max_output_tokens: int = 8_192, daily_output_tokens: int = 0,
-                   release_input_reserve: int = 0, allow_release_reserve: bool = False,
+                   release_input_reserve: int = 0, release_output_reserve: int = 0,
+                   allow_release_reserve: bool = False,
                    signing_key_path: Path | None = None,
                    max_source_bytes: int = 350_000,
                    expected_candidate: dict | None = None) -> dict:
@@ -781,38 +728,24 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
             reused = copy.deepcopy(cached)
             reused['reused'] = True
             return reused
-    if len(frozen['diff']) <= max_source_bytes:
-        sources = [{'paths': frozen['paths'], 'diff': frozen['diff']}]
-    else:
-        sources = chunk_staged_diff(
-            frozen['repo'], frozen['paths'], head=frozen['head'],
-            index_tree=frozen['index_tree'], max_source_bytes=max_source_bytes,
+    if len(frozen['diff']) > max_source_bytes:
+        raise RuntimeError(
+            'full staged diff exceeds review context limit; split it into independently '
+            'deliverable candidates instead of accepting context-losing partial review'
         )
-    results = []
-    for index, source in enumerate(sources, 1):
-        segment_note = ''
-        if len(sources) > 1:
-            segment_note = (
-                f"\n\nSegment {index}/{len(sources)}. This segment contains complete diffs for: "
-                + ', '.join(source['paths'])
-                + ". Treat the shared HEAD and INDEX_TREE as the authoritative full candidate identity."
-            )
-        results.append(runner(
-            name, worker, source['diff'], frozen['head'], frozen['index_tree'],
-            requirements=requirements + segment_note, evidence=evidence,
-            attempts=attempts, timeout=timeout,
-            state_path=state_path, runs_dir=runs_dir, current_worker=current_worker, persist=False,
-            budget_path=budget_path, max_input_tokens=max_input_tokens,
-            daily_input_tokens=daily_input_tokens,
-            max_output_tokens=max_output_tokens, daily_output_tokens=daily_output_tokens,
-            release_input_reserve=release_input_reserve,
-            allow_release_reserve=allow_release_reserve,
-            candidate_guard=candidate_guard,
-        ))
-    result = results[0] if len(results) == 1 else _aggregate_chunk_results(
-        frozen, results, requirements=requirements, evidence=evidence,
+    result = runner(
+        name, worker, frozen['diff'], frozen['head'], frozen['index_tree'],
+        requirements=requirements, evidence=evidence,
+        attempts=attempts, timeout=timeout,
+        state_path=state_path, runs_dir=runs_dir, current_worker=current_worker, persist=False,
+        budget_path=budget_path, max_input_tokens=max_input_tokens,
+        daily_input_tokens=daily_input_tokens,
+        max_output_tokens=max_output_tokens, daily_output_tokens=daily_output_tokens,
+        release_input_reserve=release_input_reserve,
+        release_output_reserve=release_output_reserve,
+        allow_release_reserve=allow_release_reserve,
+        candidate_guard=candidate_guard,
     )
-    result.setdefault('metrics', {}).setdefault('chunk_count', len(results))
     validate_finding_references(
         frozen['repo'], result['verdict'], index_tree=frozen['index_tree'],
     )

@@ -18,7 +18,7 @@ It receives no terminal, Docker, SSH, filesystem, GitHub, or secret-file access.
 2. Reject dirty tracked worktree files and non-ignored untracked files.
 3. Freeze `HEAD`, `git write-tree`, staged diff SHA, and staged paths. Those bytes and paths are the immutable review object. A best-effort guard checks Git immediately before transport, and Git is re-frozen before accepting a verdict. Concurrent changes cannot alter the already-built outbound body; they make the verdict stale and unusable. The plugin deliberately does not hold Git's index lock across a network request.
 4. Run local privacy and per-request payload-size preflight.
-5. Reuse an exact verified signed PASS, or review once/by file-bound chunks.
+5. Reuse an exact verified signed PASS, or review the complete diff once. An oversized candidate fails closed before transport.
 6. Validate strict verdict shape and all P0/P1 `file:line` references.
 7. Re-freeze HEAD and index. Any mismatch becomes `STALE`.
 8. Build the aggregate receipt, sign it locally, and atomically persist it.
@@ -37,7 +37,9 @@ outside the gate so reviewer budget is spent only on final candidates.
 The route fingerprint hashes only provider name, model, normalized API mode, and canonical endpoint. It never hashes or serializes API keys, authorization headers, or key-file contents.
 
 Reviewer workers are explicitly ordered in configuration and restricted to a local
-model/transport allowlist. Multiple providers may serve the same approved model.
+model/transport allowlist. Every route must be outside `author_model_families`,
+and no two routes may share a model family. Provider diversity without cognitive
+model diversity is not treated as independent review.
 Fallback is permitted only for infrastructure classes (including one exhausted
 same-route invalid-verdict retry). A valid `BLOCKED`, privacy failure, budget
 failure, policy failure, or stale candidate is final and cannot select another
@@ -50,15 +52,27 @@ When JSON mode is disabled, response recovery may extract a bare JSON object fro
 fenced/padded text, but the extracted value still must pass the full strict
 verdict schema.
 
-There is no self-imposed daily input/output cap by default. The ledger retains
-usage attribution for observability, while provider/account limits remain
-authoritative. Optional operator-defined daily caps are supported only when
-explicitly configured; if present they are global across all routes, so switching
-to the fallback cannot create a second allowance.
+The default shared daily budget is 1,000,000 input and 200,000 output tokens,
+with 200,000 input and 40,000 output tokens protected for explicit release
+reviews. Operator-defined overrides are global across all routes, so switching
+to the fallback cannot create a second allowance. Explicit zero is the deliberate
+unlimited override.
 
-## Segmentation
+## Full-context review
 
-Segmentation is deterministic and file-boundary only. The full candidate identity stays authoritative. Every chunk result must report the same model and route fingerprint; an oversized single-file diff is rejected. The aggregate Verdict is the conjunction of every chunk Verdict and concatenates all findings.
+The gate never turns several partial model judgements into a whole-candidate
+PASS. `max_source_bytes` bounds the complete staged diff; exceeding it fails
+closed before transport. This preserves the cross-file context needed to catch
+reference drift, protocol mismatches, and lifecycle wiring defects.
+
+## Gate seniority
+
+`load_bearing` is the fail-closed default. `secondary` changes only the disposition
+of retryable reviewer infrastructure failure: it may report
+`blocks_handoff=false` when a stronger executable exact-SHA gate is authoritative.
+Concrete findings, privacy/policy failures, secret findings, and stale candidates
+always block. Pre-work design criticism stays outside this plugin and has no
+receipt or release authority.
 
 ## Receipt signature
 

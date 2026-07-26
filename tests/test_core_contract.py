@@ -50,6 +50,15 @@ def test_route_fingerprint_excludes_credentials():
     assert 'secret' not in a['route_sha']
 
 
+def test_every_approved_reviewer_has_a_recognized_model_family():
+    from hermes_code_review import core
+    unknown = {
+        model for model, _api_mode in core.APPROVED_REVIEWER_IDENTITIES
+        if core.model_family(model) is None
+    }
+    assert unknown == set()
+
+
 def test_keyfile_must_be_0600_and_under_allowed_dir(tmp_path, monkeypatch):
     from hermes_code_review import core
     monkeypatch.setattr(core, 'RESERVE_KEY_DIR', tmp_path)

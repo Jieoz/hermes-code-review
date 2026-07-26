@@ -59,6 +59,54 @@ def test_json_mode_false_omits_response_format():
     assert 'response_format' not in body
 
 
+def test_temperature_can_be_omitted_for_routes_that_reject_it():
+    from hermes_code_review import core
+    snap = core.worker_snapshot(
+        core.APPROVED_WORKER,
+        {**BASE, 'review_temperature': None},
+    )
+    body = core._review_body(snap, 'prompt', 512)
+    assert 'temperature' not in body
+
+
+def test_temperature_defaults_to_deterministic_zero():
+    from hermes_code_review import core
+    snap = core.worker_snapshot(core.APPROVED_WORKER, BASE)
+    assert core._review_body(snap, 'prompt', 512)['temperature'] == 0
+
+
+def test_temperature_is_transport_detail_not_route_identity():
+    from hermes_code_review import core
+    default = core.worker_snapshot(core.APPROVED_WORKER, BASE)
+    omitted = core.worker_snapshot(
+        core.APPROVED_WORKER,
+        {**BASE, 'review_temperature': None},
+    )
+    assert default['route_sha'] == omitted['route_sha']
+
+
+def test_reasoning_effort_is_optional_transport_shaping():
+    from hermes_code_review import core
+    default = core.worker_snapshot(core.APPROVED_WORKER, BASE)
+    low = core.worker_snapshot(
+        core.APPROVED_WORKER,
+        {**BASE, 'review_reasoning_effort': 'low'},
+    )
+    body = core._review_body(low, 'prompt', 512)
+    assert body['reasoning_effort'] == 'low'
+    assert default['route_sha'] == low['route_sha']
+
+
+def test_reasoning_effort_rejects_unknown_values():
+    import pytest
+    from hermes_code_review import core
+    with pytest.raises(ValueError, match='review_reasoning_effort'):
+        core.worker_snapshot(
+            core.APPROVED_WORKER,
+            {**BASE, 'review_reasoning_effort': 'turbo'},
+        )
+
+
 def test_json_mode_is_transport_detail_not_route_identity():
     """Toggling review_json_mode must NOT change route_sha: it is a transport
     detail, not a reviewer-identity change."""

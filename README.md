@@ -6,11 +6,11 @@ Fail-closed independent code review for immutable staged Git candidates in [Herm
 
 - Reviews exactly `HEAD + INDEX_TREE`; a changed HEAD or index produces `STALE`.
 - Rejects tracked unstaged files and non-ignored untracked files.
-- Uses an explicit ordered reviewer pool restricted to approved model/transport identities; only infrastructure failures advance to the next route.
+- Uses an explicit ordered reviewer pool restricted to approved model/transport identities; every route must be outside the configured author model families and every reviewer route must use a different model family.
 - Never shops for a PASS: a valid `BLOCKED` verdict is final and cannot trigger fallback.
 - Blocks sensitive paths and secret-like material before any remote request.
-- Applies no self-imposed daily token cap by default; provider/account limits remain authoritative.
-- Splits large staged diffs into deterministic file chunks bound to one immutable candidate.
+- Applies shared 1,000,000-input / 200,000-output daily caps by default and protects 200,000 input plus 40,000 output tokens for final releases; operators may override these values explicitly.
+- Reviews the complete staged diff as one semantic unit. Oversized candidates fail closed instead of producing context-losing partial PASSes.
 - Requires strict JSON findings with valid `file:line` for P0/P1.
 - Binds receipts to requirements and evidence hashes, then signs them locally with HMAC.
 - Reuses an existing verified PASS only when candidate, route, requirements, and evidence all match exactly.
@@ -40,8 +40,9 @@ the acceptance criteria plus concrete test/static evidence. A changed candidate
 invalidates the verdict and must be reviewed again.
 
 Do not spend this gate on read-only investigation, early work-in-progress edits,
-or documentation-only changes. It is the final independent gate, not a substitute
-for implementation tests.
+or documentation-only changes. Early dissent belongs in a separate read-only
+design critic with no receipt or release authority; this plugin remains the one
+final independent gate.
 
 **`code_review_status` is never a release gate.** Only a signed substantive
 `review_git_candidate` PASS for the unchanged staged candidate can authorize the
@@ -68,26 +69,31 @@ may serve an approved reviewer model so one API circuit cannot halt the gate:
 ```yaml
 main_token_reserve:
   workers:
-    gpt_review:
+    grok_review:
       enabled: true
       provider: custom
-      model: gpt-5.6-sol
+      model: grok-4.5
       base_url: https://primary-review.example/v1
       api_mode: chat_completions
-      api_key_file: /opt/data/secrets/reserve_keys/gpt_review
-    opus_review:
+      api_key_file: /opt/data/secrets/reserve_keys/grok_review
+    kimi_review:
       enabled: true
       provider: custom
-      model: claude-opus-4-8
+      model: kimi-k3
       base_url: https://fallback-review.example/v1
-      api_mode: anthropic_messages
-      api_key_file: /opt/data/secrets/reserve_keys/opus_review
+      api_mode: chat_completions
+      api_key_file: /opt/data/secrets/reserve_keys/kimi_review
 
 code_review:
-  workers: [gpt_review, opus_review]
+  workers: [grok_review, kimi_review]
+  author_model_families: [gpt, claude]
   max_source_bytes: 200000
   max_input_tokens: 120000
   max_output_tokens: 8192
+  daily_input_tokens: 1000000
+  daily_output_tokens: 200000
+  release_input_reserve: 200000
+  release_output_reserve: 40000
 ```
 
 Per-route transport knobs (not part of reviewer identity / `route_sha`) may be set
@@ -98,8 +104,15 @@ hybgzs_grok45:
   model: grok-4.5
   api_mode: chat_completions
   review_json_mode: false          # omit API response_format; prompt still requires strict JSON
-  review_max_attempts: 6           # floor on same-route retries for intermittent 503/timeouts
-  review_backoff_cap_seconds: 20   # longer backoff while riding through exhausted channels
+  review_temperature: null         # omit unsupported temperature; strict parser is unchanged
+  review_max_attempts: 2           # bounded same-route retry before pool fallback
+  review_backoff_cap_seconds: 20   # cap retry spacing for exhausted channels
+cunai_k3:
+  model: kimi-k3
+  api_mode: chat_completions
+  review_json_mode: false
+  review_temperature: null
+  review_reasoning_effort: low     # finish before this relay's hard upstream timeout
 ```
 
 - `review_json_mode: false` still fail-closes on invalid verdicts; it only allows a
@@ -108,12 +121,17 @@ hybgzs_grok45:
 - Higher `review_max_attempts` scales the local circuit threshold so a single request
   cannot open its own circuit purely by using its configured retries.
 
-`max_input_tokens` and `max_output_tokens` are per-request payload bounds, not
-daily quotas. Optional operator-defined daily caps remain supported only when
-explicitly configured; zero or omitted daily limits mean unlimited.
+`max_input_tokens` and `max_output_tokens` are per-request payload bounds. Daily
+limits are shared across the whole ordered pool, so fallback never creates a
+second allowance. Both input and output keep protected release reserves;
+routine reviews cannot consume them. Explicit zero still means unlimited, but
+omission uses the bounded defaults above.
 
 Approved identities are currently `gpt-5.6-sol/chat_completions`,
-`claude-opus-4-8/anthropic_messages`, and `grok-4.5/chat_completions`.
+`claude-opus-4-8/anthropic_messages`, `grok-4.5/chat_completions`, and
+`kimi-k3/chat_completions`. Approval only permits configuration; the mandatory
+`author_model_families` exclusion and reviewer-family uniqueness checks decide
+which identities may actually sign in one deployment.
 Credential files must be regular files under `/opt/data/secrets/reserve_keys` with mode `0600`. Credentials, base URLs, and authorization headers are excluded from receipts and metrics.
 
 ## CLI
@@ -135,9 +153,19 @@ hermes-code-review review-git \
   --release-gate
 ```
 
-`--release-gate` matters only when an operator has explicitly configured an
-optional release reserve. With the default unlimited daily policy it has no
-quota effect.
+`--release-gate` allows a final tag, Release, or deployment review to consume
+the protected release reserve. Ordinary review cannot consume it.
+
+`gate_role` makes project seniority explicit:
+
+- `load_bearing` (default): reviewer infrastructure failure blocks handoff.
+- `secondary`: retryable reviewer infrastructure failure reports
+  `blocks_handoff=false`; a concrete `BLOCKED`, privacy/policy failure, stale
+  candidate, or secret finding still blocks.
+
+Use `secondary` only when a project has a stronger executable gate, such as an
+exact-SHA headless-Chromium replay that loads the real MV3 production code.
+Compiled or cross-platform candidates normally keep `load_bearing`.
 
 `status` is deliberately local and free: it validates every configured approved
 route, credential-file contract, circuit state, and observed usage without
@@ -181,7 +209,12 @@ hermes-code-review verify-receipt review.json \
 
 ## Large candidates
 
-A candidate larger than `max_source_bytes` is split only on staged file boundaries. Each chunk is reviewed by the same fixed route and bound to the same HEAD/index. A single file larger than the cap fails closed instead of being partially reviewed. Any chunk failure blocks the aggregate result.
+A candidate larger than `max_source_bytes` fails closed before any reviewer
+request. File-boundary chunking was deliberately removed because independently
+passing chunks cannot prove cross-file reference, protocol, or lifecycle
+consistency. Split the work into independently deliverable candidates or use a
+higher-capacity preapproved route; never relabel partial review as whole-candidate
+PASS.
 
 ## Quality benchmark
 

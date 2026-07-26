@@ -86,6 +86,27 @@ def test_routine_review_cannot_consume_release_reserve(tmp_path):
     assert release_reservation
 
 
+def test_routine_review_cannot_consume_release_output_reserve(tmp_path):
+    from hermes_code_review.policy import PolicyViolation, reserve_budget
+    ledger = tmp_path / 'budget.json'
+    reserve_budget(
+        ledger, route_sha='route', estimated_input_tokens=1,
+        estimated_output_tokens=30, daily_input_limit=100, daily_output_limit=50,
+        release_output_reserve=10,
+    )
+    with pytest.raises(PolicyViolation, match='output budget reached protected release reserve'):
+        reserve_budget(
+            ledger, route_sha='route', estimated_input_tokens=1,
+            estimated_output_tokens=11, daily_input_limit=100, daily_output_limit=50,
+            release_output_reserve=10,
+        )
+    assert reserve_budget(
+        ledger, route_sha='route', estimated_input_tokens=1,
+        estimated_output_tokens=20, daily_input_limit=100, daily_output_limit=50,
+        release_output_reserve=10, allow_release_reserve=True,
+    )
+
+
 def test_daily_budget_is_global_across_primary_and_fallback_routes(tmp_path):
     from hermes_code_review.policy import PolicyViolation, budget_status, reserve_budget
     ledger = tmp_path / 'budget.json'
@@ -155,7 +176,8 @@ def test_budget_status_reports_routine_release_reserve_and_reset(tmp_path):
 
     value = policy.budget_status(
         ledger, route_sha='route', daily_input_limit=1000,
-        daily_output_limit=100, release_input_reserve=200, now=1000,
+        daily_output_limit=100, release_input_reserve=200,
+        release_output_reserve=30, now=1000,
     )
 
     assert value == {
@@ -166,6 +188,8 @@ def test_budget_status_reports_routine_release_reserve_and_reset(tmp_path):
         'release_input_reserve': 200,
         'output_used': 25,
         'output_remaining': 75,
+        'routine_output_remaining': 45,
+        'release_output_reserve': 30,
         'reset_at': '1970-01-02T00:00:00Z',
     }
 
@@ -191,10 +215,13 @@ def test_zero_daily_limits_are_unlimited_and_have_no_reset(tmp_path):
     status = policy.budget_status(
         ledger, route_sha='fallback', daily_input_limit=0,
         daily_output_limit=0, release_input_reserve=200_000,
+        release_output_reserve=40_000,
         now=1_769_212_800,
     )
     assert status['input_remaining'] is None
     assert status['routine_input_remaining'] is None
     assert status['output_remaining'] is None
+    assert status['routine_output_remaining'] is None
     assert status['release_input_reserve'] == 0
+    assert status['release_output_reserve'] == 0
     assert status['reset_at'] is None

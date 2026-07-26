@@ -26,7 +26,7 @@ def configured_worker():
 def configured_fallback_worker():
     return {
         'provider': 'custom', 'base_url': 'https://fallback.example/v1',
-        'api_key': 'fallback-secret', 'model': 'claude-opus-4-8',
+        'api_key': 'fallback-secret', 'model': 'claude-opus-5',
         'api_mode': 'anthropic_messages', 'enabled': True,
     }
 
@@ -47,7 +47,9 @@ def test_fallback_policy_accepts_only_infrastructure_classes():
     assert plugin._fallback_eligible(core.InvalidVerdictError('invalid review verdict')) is True
     assert plugin._fallback_eligible(policy.PolicyViolation('secret-like material')) is False
     assert plugin._fallback_eligible(RuntimeError('stale review verdict')) is False
-    assert plugin._fallback_eligible(core.ReviewHTTPError(403, 'forbidden')) is False
+    assert plugin._fallback_eligible(core.ReviewHTTPError(400, 'bad request')) is True
+    assert plugin._fallback_eligible(core.ReviewHTTPError(401, 'unauthorized')) is True
+    assert plugin._fallback_eligible(core.ReviewHTTPError(403, 'forbidden')) is True
 
 
 def test_review_tool_returns_machine_pass(monkeypatch, tmp_path):
@@ -75,7 +77,8 @@ def test_review_tool_returns_machine_pass(monkeypatch, tmp_path):
     assert value['status'] == 'PASS'
     assert value['receipt']['reviewer_model'] == 'grok-4.5'
     assert seen['signing_key_path'] == plugin.SIGNING_KEY
-    assert seen['max_source_bytes'] == 350_000
+    assert 'max_source_bytes' not in seen
+    assert seen['max_input_tokens'] == 120_000
     assert seen['max_output_tokens'] == 8_192
     assert seen['usage_path'] == plugin.core.USAGE_LEDGER
     assert not {
@@ -100,6 +103,48 @@ def test_review_tool_fails_closed_on_any_exception(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin.core, 'run_git_review', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('HTTP 504')))
     value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
     assert value == {'status': 'INFRA_FAILED', 'error_class': 'HTTP_5XX'}
+
+
+def test_local_runtime_failure_is_not_mislabeled_as_reviewer_infrastructure(monkeypatch, tmp_path):
+    from hermes_code_review import plugin
+    monkeypatch.setattr(plugin, 'SIGNING_KEY', tmp_path / 'receipt.key', raising=False)
+    monkeypatch.setattr(plugin, 'METRICS', tmp_path / 'metrics.jsonl', raising=False)
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
+        'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
+        'code_review': {'author_model_families': ['gpt']},
+    })
+    monkeypatch.setattr(
+        plugin.core, 'run_git_review',
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('staged review candidate is empty')),
+    )
+
+    value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
+
+    assert value == {'status': 'GATE_FAILED', 'error_class': 'RUNTIME_ERROR'}
+
+
+def test_candidate_preflight_rejection_is_distinct_from_gate_and_infrastructure(monkeypatch, tmp_path):
+    from hermes_code_review import plugin, policy
+    monkeypatch.setattr(plugin, 'SIGNING_KEY', tmp_path / 'receipt.key', raising=False)
+    monkeypatch.setattr(plugin, 'METRICS', tmp_path / 'metrics.jsonl', raising=False)
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
+        'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
+        'code_review': {'author_model_families': ['gpt']},
+    })
+    monkeypatch.setattr(
+        plugin.core, 'run_git_review',
+        lambda *a, **k: (_ for _ in ()).throw(
+            policy.CandidateViolation('request token estimate exceeds limit')
+        ),
+    )
+
+    value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
+
+    assert value == {
+        'status': 'CANDIDATE_REJECTED', 'error_class': 'REQUEST_TOO_LARGE',
+    }
 
 
 def test_review_tool_uses_preapproved_fallback_only_for_infrastructure_failure(monkeypatch, tmp_path):
@@ -138,7 +183,7 @@ def test_review_tool_uses_preapproved_fallback_only_for_infrastructure_failure(m
     assert value['status'] == 'PASS'
     assert value['fallback_used'] is True
     assert value['route']['name'] == 'cc_review_route'
-    assert value['route']['model'] == 'claude-opus-4-8'
+    assert value['route']['model'] == 'claude-opus-5'
 
 
 def test_review_tool_refuses_fallback_when_candidate_changes_between_routes(monkeypatch, tmp_path):
@@ -168,55 +213,67 @@ def test_review_tool_refuses_fallback_when_candidate_changes_between_routes(monk
     monkeypatch.setattr(plugin.core, 'run_git_review', fail_primary)
     value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
     assert called == ['hybgzs_grok45']
-    assert value == {'status': 'INFRA_FAILED', 'error_class': 'STALE'}
+    assert value == {'status': 'CANDIDATE_REJECTED', 'error_class': 'STALE'}
 
 
-def test_review_routes_reject_any_author_model_family(monkeypatch):
+def test_review_routes_auto_select_enabled_unique_non_author_families(monkeypatch):
     from hermes_code_review import plugin
     workers = {
         'gpt-primary': configured_worker() | {'model': 'gpt-5.6-sol'},
-        'grok': configured_worker(),
-    }
-    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
-        'main_token_reserve': {'workers': workers},
-        'code_review': {
-            'workers': ['gpt-primary', 'grok'],
-            'author_model_families': ['gpt', 'claude'],
-        },
-    })
-    with pytest.raises(RuntimeError, match='author model family'):
-        plugin._routes()
-
-
-def test_review_routes_require_distinct_reviewer_model_families(monkeypatch):
-    from hermes_code_review import plugin
-    workers = {
         'grok-a': configured_worker(),
         'grok-b': configured_worker() | {'base_url': 'https://other.example/v1'},
+        'kimi': configured_kimi_worker(),
+        'disabled-kimi': configured_kimi_worker() | {'enabled': False},
+    }
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'main_token_reserve': {'workers': workers},
+        'code_review': {'author_model_families': ['gpt', 'claude']},
+    })
+    routes, _ = plugin._routes()
+    assert [name for name, _worker, _snapshot in routes] == ['grok-a', 'kimi']
+
+
+def test_review_routes_use_reserve_inventory_not_legacy_static_list(monkeypatch):
+    from hermes_code_review import plugin
+    workers = {
+        'grok': configured_worker(),
+        'kimi': configured_kimi_worker(),
     }
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
         'main_token_reserve': {'workers': workers},
         'code_review': {
-            'workers': ['grok-a', 'grok-b'],
-            'author_model_families': ['gpt', 'claude'],
-        },
-    })
-    with pytest.raises(RuntimeError, match='distinct model families'):
-        plugin._routes()
-
-
-def test_review_routes_accept_ordered_unique_non_author_families(monkeypatch):
-    from hermes_code_review import plugin
-    workers = {'grok': configured_worker(), 'kimi': configured_kimi_worker()}
-    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
-        'main_token_reserve': {'workers': workers},
-        'code_review': {
-            'workers': ['grok', 'kimi'],
+            'workers': ['grok'],
             'author_model_families': ['gpt', 'claude'],
         },
     })
     routes, _ = plugin._routes()
     assert [name for name, _worker, _snapshot in routes] == ['grok', 'kimi']
+
+
+def test_review_routes_fail_closed_when_reserve_pool_has_no_independent_model(monkeypatch):
+    from hermes_code_review import plugin
+    workers = {'gpt': configured_worker() | {'model': 'gpt-5.6-sol'}}
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'main_token_reserve': {'workers': workers},
+        'code_review': {'author_model_families': ['gpt', 'claude']},
+    })
+    with pytest.raises(RuntimeError, match='no eligible independent reviewer'):
+        plugin._routes()
+
+
+def test_review_routes_accept_current_opus_generation_from_reserve_pool(monkeypatch):
+    from hermes_code_review import plugin
+    opus = configured_fallback_worker() | {
+        'model': 'claude-opus-5', 'api_mode': 'anthropic_messages',
+    }
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'main_token_reserve': {'workers': {'opus': opus}},
+        'code_review': {'author_model_families': ['gpt']},
+    })
+    routes, _ = plugin._routes()
+    assert [(name, snapshot['model']) for name, _worker, snapshot in routes] == [
+        ('opus', 'claude-opus-5'),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -248,7 +305,7 @@ def test_infrastructure_failure_blocks_only_load_bearing_review(
     assert value['blocks_handoff'] is expected_blocks
 
 
-def test_current_pool_worker_rejects_removed_or_reordered_route(monkeypatch):
+def test_current_pool_worker_rejects_reserve_inventory_change(monkeypatch):
     from hermes_code_review import plugin
 
     workers = {
@@ -265,9 +322,33 @@ def test_current_pool_worker_rejects_removed_or_reordered_route(monkeypatch):
     monkeypatch.setattr(plugin.core, 'load_config', lambda: config)
     routes, _ = plugin._routes()
     expected = plugin._pool_identity(routes)
-    config['code_review']['workers'] = ['cc_review_route', 'hybgzs_grok45']
+    config['main_token_reserve']['workers']['hybgzs_grok45']['enabled'] = False
     with pytest.raises(RuntimeError, match='reviewer pool changed'):
         plugin._current_pool_worker(expected, 'hybgzs_grok45')
+
+
+def test_current_pool_identity_does_not_change_when_circuit_state_changes(monkeypatch, tmp_path):
+    from hermes_code_review import core, plugin
+    workers = {
+        'grok-a': configured_worker(),
+        'grok-b': configured_worker() | {'base_url': 'https://other.example/v1'},
+        'kimi': configured_kimi_worker(),
+    }
+    config = {
+        'main_token_reserve': {'workers': workers},
+        'code_review': {'author_model_families': ['gpt', 'claude']},
+    }
+    monkeypatch.setattr(plugin.core, 'STATE', tmp_path / 'health.json')
+    monkeypatch.setattr(plugin.core.time, 'time', lambda: 101)
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: config)
+    routes, _ = plugin._routes()
+    expected = plugin._pool_identity(routes)
+    assert [name for name, _worker, _snapshot in routes] == ['grok-a', 'kimi']
+
+    primary = core.worker_snapshot('grok-a', workers['grok-a'])
+    core.record_failure(plugin.core.STATE, primary['route_sha'], threshold=1, cooldown=300, now=100)
+
+    assert plugin._current_pool_worker(expected, 'grok-a') is workers['grok-a']
 
 
 def test_explicit_zero_per_request_bound_is_rejected():
@@ -371,7 +452,7 @@ def test_post_verdict_json_persistence_error_never_triggers_fallback(monkeypatch
     monkeypatch.setattr(plugin.core, 'run_git_review', persistence_failure)
     value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
     assert called == ['hybgzs_grok45']
-    assert value['status'] == 'INFRA_FAILED'
+    assert value['status'] == 'GATE_FAILED'
 
 
 def test_review_tool_fails_closed_when_metrics_sink_fails(monkeypatch, tmp_path):
@@ -391,7 +472,7 @@ def test_review_tool_fails_closed_when_metrics_sink_fails(monkeypatch, tmp_path)
     monkeypatch.setattr(plugin.core, 'run_git_review', lambda *a, **k: plugin.signing.sign_result(result, plugin.SIGNING_KEY))
     monkeypatch.setattr(plugin.observability, 'record_event', lambda *a, **k: (_ for _ in ()).throw(OSError('sink down')))
     value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
-    assert value['status'] == 'INFRA_FAILED'
+    assert value['status'] == 'GATE_FAILED'
 
 
 def test_public_result_is_whitelisted_and_rejects_known_credential(monkeypatch, tmp_path):
@@ -416,7 +497,7 @@ def test_public_result_is_whitelisted_and_rejects_known_credential(monkeypatch, 
     assert 'private.invalid' not in text and 'must-not-escape' not in text
     result['verdict']['summary'] = configured_worker()['api_key']
     value = json.loads(plugin.review_git_candidate({'repo': str(tmp_path)}))
-    assert value['status'] == 'INFRA_FAILED'
+    assert value['status'] == 'GATE_FAILED'
 
 
 def test_status_tool_is_non_secret(monkeypatch, tmp_path):
@@ -445,6 +526,8 @@ def test_status_tool_is_non_secret(monkeypatch, tmp_path):
     assert value['status'] == 'READY'
     assert value['worker'] == 'hybgzs_grok45' and value['model'] == 'grok-4.5'
     assert value['version'] == __version__
+    assert value['selection'] == 'reserve_pool_auto'
+    assert value['reviewer_families'] == ['grok']
     assert value['usage'] == {
         'day_utc': '1970-01-01', 'input_used': 120, 'output_used': 12,
     }
@@ -545,5 +628,5 @@ def test_status_tool_sanitizes_route_failures_and_never_probes_network(monkeypat
 
     value = json.loads(plugin.code_review_status({}))
 
-    assert value == {'status': 'INFRA_FAILED', 'error_class': 'PRIVACY'}
+    assert value == {'status': 'GATE_FAILED', 'error_class': 'PRIVACY'}
     assert 'sensitive path blocked' not in json.dumps(value)

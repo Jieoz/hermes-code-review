@@ -12,7 +12,7 @@ METRICS = core.HERMES_HOME / "state/code_review_metrics.jsonl"
 
 REVIEW_SCHEMA = {
     "name": "review_git_candidate",
-    "description": "Review the immutable staged Git candidate with the configured fixed independent reviewer. Fails closed on drift, infrastructure errors, secrets, or invalid verdicts.",
+    "description": "Review the immutable staged Git candidate with an independent model selected automatically from the reserve pool. Fails closed on drift, infrastructure errors, secrets, or invalid verdicts.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -31,7 +31,7 @@ REVIEW_SCHEMA = {
 
 STATUS_SCHEMA = {
     "name": "code_review_status",
-    "description": "Read the fixed reviewer identity and local readiness (configuration and circuit state) without exposing credentials or spending a network probe.",
+    "description": "Read the automatically selected reserve-pool reviewer identities and local readiness without exposing credentials or spending a network probe.",
     "parameters": {"type": "object", "properties": {}},
 }
 
@@ -40,16 +40,8 @@ def _routes() -> tuple[list[tuple[str, dict[str, Any], dict[str, Any]]], dict[st
     cfg = core.load_config()
     workers = (cfg.get("main_token_reserve") or {}).get("workers") or {}
     settings = cfg.get("code_review") or {}
-    names = settings.get("workers")
-    if names is None:
-        names = [core.selected_name(cfg), *(settings.get("fallback_workers") or [])]
-    if (
-        not isinstance(names, list)
-        or not names
-        or not all(isinstance(name, str) and name for name in names)
-        or len(names) != len(set(names))
-    ):
-        raise RuntimeError("code-review workers must be a non-empty list of unique worker names")
+    if not isinstance(workers, dict) or not workers:
+        raise RuntimeError("main_token_reserve.workers must contain reviewer candidates")
     author_families = settings.get("author_model_families")
     if (
         not isinstance(author_families, list)
@@ -58,20 +50,34 @@ def _routes() -> tuple[list[tuple[str, dict[str, Any], dict[str, Any]]], dict[st
     ):
         raise RuntimeError("code_review.author_model_families must be a non-empty list")
     author_families = {value.strip().lower() for value in author_families}
-    routes = []
-    reviewer_families: set[str] = set()
-    for name in names:
-        worker = workers.get(name)
-        if not isinstance(worker, dict):
-            raise RuntimeError("configured code-review route is not preapproved")
-        snapshot = core.worker_snapshot(name, worker)
-        family = core.model_family(snapshot["model"])
+
+    # The reserve inventory is the single reviewer-pool authority. Select at most
+    # one route per cognitive model family; duplicate endpoints are redundancy,
+    # not independent judgement. Inventory order is stable review intent; mutable
+    # circuit state must never rewrite the frozen pool identity mid-request.
+    selected: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {}
+    for name, worker in workers.items():
+        if not isinstance(name, str) or not name or not isinstance(worker, dict):
+            continue
+        if worker.get("enabled") is False or worker.get("review_disabled") is True:
+            continue
+        try:
+            family = core.model_family(str(worker.get("model") or ""))
+        except ValueError:
+            continue
         if family in author_families:
-            raise RuntimeError("review route uses an author model family")
-        if family in reviewer_families:
-            raise RuntimeError("review routes must use distinct model families")
-        reviewer_families.add(family)
-        routes.append((name, worker, snapshot))
+            continue
+        try:
+            snapshot = core.worker_snapshot(name, worker)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        candidate = (name, worker, snapshot)
+        if family not in selected:
+            selected[family] = candidate
+
+    routes = list(selected.values())
+    if not routes:
+        raise RuntimeError("reserve pool has no eligible independent reviewer model")
     return routes, cfg
 
 
@@ -114,10 +120,23 @@ def _error_class(exc: Exception) -> str:
 
 def _fallback_eligible(exc: Exception) -> bool:
     if isinstance(exc, core.ReviewHTTPError):
-        return exc.status == 429 or 500 <= exc.status <= 599
+        return True
     if isinstance(exc, (core.ReviewTransportError, core.InvalidVerdictError)):
         return True
     return isinstance(exc, core.CircuitOpenError)
+
+
+def _failure_status(exc: Exception, error_class: str) -> str:
+    if isinstance(exc, policy.CandidateViolation):
+        return "CANDIDATE_REJECTED"
+    if isinstance(exc, core.ReviewHTTPError):
+        return "INFRA_FAILED"
+    if error_class in {
+        "HTTP_429", "HTTP_5XX", "TIMEOUT", "TRANSPORT",
+        "INVALID_VERDICT", "CIRCUIT_OPEN", "NO_ACCOUNT",
+    }:
+        return "INFRA_FAILED"
+    return "GATE_FAILED"
 
 
 def _gate_role(args: dict[str, Any]) -> str:
@@ -194,7 +213,6 @@ def review_git_candidate(args: dict, **_: Any) -> str:
                     max_input_tokens=_positive_setting(settings, "max_input_tokens", 120_000),
                     max_output_tokens=_positive_setting(settings, "max_output_tokens", 8_192),
                     signing_key_path=SIGNING_KEY,
-                    max_source_bytes=_positive_setting(settings, "max_source_bytes", 350_000),
                     expected_candidate=invocation_frozen,
                 )
                 snapshot = candidate_snapshot
@@ -207,7 +225,7 @@ def review_git_candidate(args: dict, **_: Any) -> str:
                     current["head"] != invocation_frozen["head"]
                     or current["index_tree"] != invocation_frozen["index_tree"]
                 ):
-                    raise RuntimeError(
+                    raise policy.CandidateViolation(
                         "stale review candidate: Git HEAD or INDEX_TREE changed before fallback"
                     ) from route_exc
                 observability.record_event(
@@ -223,7 +241,7 @@ def review_git_candidate(args: dict, **_: Any) -> str:
             receipt.get("review_head") != invocation_frozen["head"]
             or receipt.get("review_index_tree") != invocation_frozen["index_tree"]
         ):
-            raise RuntimeError("stale review verdict: route result does not match invocation candidate")
+            raise policy.CandidateViolation("stale review verdict: route result does not match invocation candidate")
         signing.verify_result(result, SIGNING_KEY)
         public = _public_result(result, snapshot)
         verdict = public["verdict"]
@@ -246,9 +264,11 @@ def review_git_candidate(args: dict, **_: Any) -> str:
         )
         return json.dumps(public, ensure_ascii=False, sort_keys=True)
     except Exception as exc:
+        error_class = _error_class(exc)
+        failure_status = _failure_status(exc, error_class)
         try:
             observability.record_event(
-                METRICS, status="INFRA_FAILED", worker=worker_name,
+                METRICS, status=failure_status, worker=worker_name,
                 model=model, route_sha=route_sha,
                 elapsed_ms=round((time.monotonic() - started) * 1000),
                 input_tokens=0, output_tokens=0, error=str(exc),
@@ -256,8 +276,8 @@ def review_git_candidate(args: dict, **_: Any) -> str:
         except Exception:
             pass
         payload: dict[str, Any] = {
-            "status": "INFRA_FAILED",
-            "error_class": _error_class(exc),
+            "status": failure_status,
+            "error_class": error_class,
         }
         if "gate_role" in args:
             payload["gate_role"] = gate_role
@@ -298,6 +318,8 @@ def _local_status_payload() -> dict:
         return {
             "status": "ALL_ROUTES_UNAVAILABLE",
             "version": __version__,
+            "selection": "reserve_pool_auto",
+            "reviewer_families": [core.model_family(row["model"]) for row in route_rows],
             "worker": primary["worker"],
             "model": primary["model"],
             "api_mode": primary["api_mode"],
@@ -311,6 +333,8 @@ def _local_status_payload() -> dict:
     return {
         "status": "READY",
         "version": __version__,
+        "selection": "reserve_pool_auto",
+        "reviewer_families": [core.model_family(row["model"]) for row in route_rows],
         "worker": primary["worker"],
         "model": primary["model"],
         "api_mode": primary["api_mode"],
@@ -327,7 +351,11 @@ def code_review_status(args: dict, **_: Any) -> str:
     try:
         payload = _local_status_payload()
     except Exception as exc:
-        payload = {"status": "INFRA_FAILED", "error_class": _error_class(exc)}
+        error_class = _error_class(exc)
+        payload = {
+            "status": _failure_status(exc, error_class),
+            "error_class": error_class,
+        }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 

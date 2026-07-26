@@ -1,5 +1,5 @@
 name: hermes-code-review
-version: 0.3.1
+version: 0.3.2
 description: Full-context immutable Git review with enforced cross-family independence and project-aware gate seniority.
 provides_tools:
   - review_git_candidate

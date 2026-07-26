@@ -32,7 +32,7 @@ def classify_error(message: str) -> str:
             return 'HTTP_429'
         if 500 <= status <= 599:
             return 'HTTP_5XX'
-        return 'HTTP_OTHER'
+        return f'HTTP_{status}'
     if '1013' in text or 'no available account' in text:
         return 'NO_ACCOUNT'
     if 'timeout' in text or 'timed out' in text:
@@ -43,6 +43,8 @@ def classify_error(message: str) -> str:
         return 'INVALID_VERDICT'
     if 'circuit open' in text:
         return 'CIRCUIT_OPEN'
+    if 'request token estimate' in text:
+        return 'REQUEST_TOO_LARGE'
     if 'usage ledger' in text or 'usage reservation' in text:
         return 'USAGE_LEDGER'
     if 'secret' in text or 'sensitive path' in text:
@@ -53,7 +55,10 @@ def classify_error(message: str) -> str:
 def record_event(path: Path, *, status: str, worker: str, model: str, route_sha: str,
                  elapsed_ms: int, input_tokens: int, output_tokens: int,
                  error: str = '') -> None:
-    if status not in {'PASS', 'BLOCKED', 'INFRA_FAILED', 'STALE', 'NEEDS_EVIDENCE'}:
+    if status not in {
+        'PASS', 'BLOCKED', 'INFRA_FAILED', 'CANDIDATE_REJECTED',
+        'GATE_FAILED', 'STALE', 'NEEDS_EVIDENCE',
+    }:
         raise ValueError('invalid metrics status')
     if not all(_IDENTITY.fullmatch(value) for value in (worker, model, route_sha)):
         raise ValueError('unsafe metrics identity')

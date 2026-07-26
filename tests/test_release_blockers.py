@@ -35,12 +35,12 @@ def test_reviewer_identity_is_restricted_by_model_and_transport_not_provider_nam
 def test_preapproved_fallback_reviewer_has_a_different_fixed_identity():
     from hermes_code_review import core
     fallback = approved_worker(
-        base_url='https://fallback.example/v1', model='claude-opus-4-8',
+        base_url='https://fallback.example/v1', model='claude-opus-5',
         api_mode='anthropic_messages',
     )
     snapshot = core.worker_snapshot('oojj_opus48', fallback)
     assert snapshot['name'] == 'oojj_opus48'
-    assert snapshot['model'] == 'claude-opus-4-8'
+    assert snapshot['model'] == 'claude-opus-5'
     assert snapshot['api_mode'] == 'anthropic_messages'
     with pytest.raises(ValueError, match='approved reviewer'):
         core.worker_snapshot('oojj_opus48', fallback | {'model': 'unknown-model'})
@@ -121,5 +121,5 @@ def test_public_plugin_errors_are_classified_not_echoed(monkeypatch):
     from hermes_code_review import plugin
     monkeypatch.setattr(plugin, '_routes', lambda: (_ for _ in ()).throw(RuntimeError('Bearer super-secret')))
     payload = json.loads(plugin.review_git_candidate({'repo': '/tmp/nope'}))
-    assert payload == {'status': 'INFRA_FAILED', 'error_class': 'PRIVACY'}
+    assert payload == {'status': 'GATE_FAILED', 'error_class': 'PRIVACY'}
     assert 'secret' not in json.dumps(payload).lower()

@@ -58,10 +58,9 @@ def test_review_rejects_index_change_after_remote_verdict(tmp_path):
         )
 
 
-def test_oversized_candidate_fails_closed_without_partial_review(tmp_path, monkeypatch):
-    import pytest
+def test_complete_candidate_is_passed_to_one_reviewer_call(tmp_path, monkeypatch):
     from hermes_code_review import core
-    full = b'full staged diff larger than cap'
+    full = b'x' * 249_606
     frozen = {
         'repo': tmp_path, 'head': 'h', 'index_tree': 't',
         'diff': full, 'paths': ['a.py', 'b.py'],
@@ -73,9 +72,8 @@ def test_oversized_candidate_fails_closed_without_partial_review(tmp_path, monke
         calls.append(source)
         return result_for(core, source, passed=True)
 
-    with pytest.raises(RuntimeError, match='full staged diff exceeds'):
-        core.run_git_review(
-            tmp_path, core.APPROVED_WORKER, worker(), runner=runner,
-            runs_dir=tmp_path / 'runs', max_source_bytes=5,
-        )
-    assert calls == []
+    core.run_git_review(
+        tmp_path, core.APPROVED_WORKER, worker(), runner=runner,
+        runs_dir=tmp_path / 'runs',
+    )
+    assert calls == [full]

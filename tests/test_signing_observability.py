@@ -72,3 +72,10 @@ def test_usage_accounting_failures_have_a_stable_error_class():
     from hermes_code_review.observability import classify_error
     assert classify_error('unsafe usage ledger') == 'USAGE_LEDGER'
     assert classify_error('unknown or expired usage reservation') == 'USAGE_LEDGER'
+
+
+def test_http_4xx_error_classes_preserve_the_exact_status():
+    from hermes_code_review.observability import classify_error
+    assert classify_error('HTTP 400') == 'HTTP_400'
+    assert classify_error('HTTP 401') == 'HTTP_401'
+    assert classify_error('HTTP 403') == 'HTTP_403'

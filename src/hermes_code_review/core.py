@@ -37,7 +37,7 @@ APPROVED_MODEL = 'grok-4.5'
 APPROVED_API_MODE = 'chat_completions'
 APPROVED_REVIEWER_IDENTITIES = {
     ('gpt-5.6-sol', 'chat_completions'),
-    ('claude-opus-4-8', 'anthropic_messages'),
+    ('claude-opus-5', 'anthropic_messages'),
     ('grok-4.5', 'chat_completions'),
     ('kimi-k3', 'chat_completions'),
 }
@@ -652,7 +652,7 @@ def freeze_git_candidate(repo: Path | str) -> dict:
     repo = Path(top)
     unstaged = _git(repo, 'diff', '--quiet', '--exit-code', check=False)
     if unstaged.returncode == 1:
-        raise RuntimeError('tracked unstaged changes make the review snapshot ambiguous')
+        raise policy.CandidateViolation('tracked unstaged changes make the review snapshot ambiguous')
     if unstaged.returncode not in {0, 1}:
         raise RuntimeError(unstaged.stderr.decode(errors='replace').strip() or 'git diff failed')
     untracked = _git(repo, 'ls-files', '--others', '--exclude-standard', '-z').stdout
@@ -660,12 +660,12 @@ def freeze_git_candidate(repo: Path | str) -> dict:
         names = [item.decode(errors='replace') for item in untracked.split(b'\0') if item]
         preview = ', '.join(names[:5])
         suffix = ' …' if len(names) > 5 else ''
-        raise RuntimeError(f'nonignored untracked files make test/review evidence ambiguous: {preview}{suffix}')
+        raise policy.CandidateViolation(f'nonignored untracked files make test/review evidence ambiguous: {preview}{suffix}')
     head = _git(repo, 'rev-parse', 'HEAD').stdout.decode().strip()
     index_tree = _git(repo, 'write-tree').stdout.decode().strip()
     diff = _git(repo, 'diff', '--cached', '--binary').stdout
     if not diff:
-        raise RuntimeError('staged review candidate is empty')
+        raise policy.CandidateViolation('staged review candidate is empty')
     names = _git(repo, 'diff', '--cached', '--name-only', '-z').stdout
     paths = [item.decode(errors='replace') for item in names.split(b'\0') if item]
     return {'repo': repo, 'head': head, 'index_tree': index_tree, 'diff': diff, 'paths': paths}
@@ -677,7 +677,6 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
                    runner=run_review, usage_path: Path | None = None,
                    max_input_tokens: int = 120_000, max_output_tokens: int = 8_192,
                    signing_key_path: Path | None = None,
-                   max_source_bytes: int = 350_000,
                    expected_candidate: dict | None = None) -> dict:
     current = freeze_git_candidate(repo)
     if expected_candidate is not None:
@@ -685,7 +684,7 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
             current['head'] != expected_candidate['head']
             or current['index_tree'] != expected_candidate['index_tree']
         ):
-            raise RuntimeError('stale review candidate: Git HEAD or INDEX_TREE changed before route review')
+            raise policy.CandidateViolation('stale review candidate: Git HEAD or INDEX_TREE changed before route review')
         frozen = copy.deepcopy(expected_candidate)
     else:
         frozen = current
@@ -693,7 +692,7 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
     def candidate_guard() -> None:
         guarded = freeze_git_candidate(frozen['repo'])
         if guarded['head'] != frozen['head'] or guarded['index_tree'] != frozen['index_tree']:
-            raise RuntimeError('stale review candidate: Git HEAD or INDEX_TREE changed before transport')
+            raise policy.CandidateViolation('stale review candidate: Git HEAD or INDEX_TREE changed before transport')
 
     policy.check_privacy(frozen['paths'], frozen['diff'], requirements, evidence)
     if signing_key_path is not None:
@@ -708,7 +707,7 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
         if cached is not None:
             after = freeze_git_candidate(frozen['repo'])
             if after['head'] != frozen['head'] or after['index_tree'] != frozen['index_tree']:
-                raise RuntimeError('stale cached review: Git HEAD or INDEX_TREE changed during cache lookup')
+                raise policy.CandidateViolation('stale cached review: Git HEAD or INDEX_TREE changed during cache lookup')
             if (
                 current_worker is not None
                 and worker_snapshot(name, current_worker())['route_sha'] != snapshot['route_sha']
@@ -717,11 +716,6 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
             reused = copy.deepcopy(cached)
             reused['reused'] = True
             return reused
-    if len(frozen['diff']) > max_source_bytes:
-        raise RuntimeError(
-            'full staged diff exceeds review context limit; split it into independently '
-            'deliverable candidates instead of accepting context-losing partial review'
-        )
     result = runner(
         name, worker, frozen['diff'], frozen['head'], frozen['index_tree'],
         requirements=requirements, evidence=evidence,
@@ -736,7 +730,7 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
     )
     after = freeze_git_candidate(frozen['repo'])
     if after['head'] != frozen['head'] or after['index_tree'] != frozen['index_tree']:
-        raise RuntimeError('stale review verdict: Git HEAD or INDEX_TREE changed during review')
+        raise policy.CandidateViolation('stale review verdict: Git HEAD or INDEX_TREE changed during review')
     if signing_key_path is not None:
         result = signing.sign_result(result, signing_key_path)
     result['reused'] = False

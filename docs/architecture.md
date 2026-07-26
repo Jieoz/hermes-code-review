@@ -14,7 +14,7 @@ It receives no terminal, Docker, SSH, filesystem, GitHub, or secret-file access.
 
 ## Candidate state machine
 
-1. Resolve the explicit ordered reviewer pool and validate every model/transport identity.
+1. Derive the reviewer pool from enabled reserve inventory, exclude author families, validate supported model/transport identities, and select the first eligible route per reviewer family in stable inventory order.
 2. Reject dirty tracked worktree files and non-ignored untracked files.
 3. Freeze `HEAD`, `git write-tree`, staged diff SHA, and staged paths. Those bytes and paths are the immutable review object. A best-effort guard checks Git immediately before transport, and Git is re-frozen before accepting a verdict. Concurrent changes cannot alter the already-built outbound body; they make the verdict stale and unusable. The plugin deliberately does not hold Git's index lock across a network request.
 4. Run local privacy and per-request payload-size preflight.
@@ -36,13 +36,17 @@ outside the gate so substantive reviewer requests are spent only on final candid
 
 The route fingerprint hashes only provider name, model, normalized API mode, and canonical endpoint. It never hashes or serializes API keys, authorization headers, or key-file contents.
 
-Reviewer workers are explicitly ordered in configuration and restricted to a local
-model/transport allowlist. Every route must be outside `author_model_families`,
-and no two routes may share a model family. Provider diversity without cognitive
-model diversity is not treated as independent review.
-Fallback is permitted only for infrastructure classes (including one exhausted
-same-route invalid-verdict retry). A valid `BLOCKED`, privacy failure, policy
-failure, or stale candidate is final and cannot select another
+Reviewer workers are discovered in reserve-inventory order and restricted to a
+local model/transport allowlist. Disabled/unsupported entries and every route in
+`author_model_families` are skipped. The first eligible route per reviewer family
+enters the chain; mutable circuit state never changes that frozen identity.
+Provider diversity without cognitive model diversity is infrastructure redundancy,
+not independent judgement.
+Fallback is permitted only after a remote reviewer attempt fails (any HTTP
+rejection, transport/timeout/circuit failure, or one exhausted same-route
+invalid-verdict retry). Exact HTTP 4xx classes remain observable, while the next
+preauthorized cross-family route may still review the unchanged candidate. A
+valid `BLOCKED`, privacy failure, policy failure, or stale candidate is final and cannot select another
 reviewer. Fallback therefore improves availability without shopping for a PASS.
 
 Per-route transport knobs (`review_json_mode`, `review_max_attempts`,
@@ -55,15 +59,20 @@ verdict schema.
 The usage ledger atomically reserves and reconciles primary and fallback traffic
 for observability. It has no local daily cap and cannot block a normal review.
 Aggregate quota enforcement belongs to the configured provider/account. Local
-limits exist only for one request (`max_source_bytes`, `max_input_tokens`, and
-`max_output_tokens`) so impossible payloads fail before transport.
+limits exist only for one request: `max_input_tokens` is the single authority for
+the complete encoded prompt and `max_output_tokens` bounds the response.
 
 ## Full-context review
 
 The gate never turns several partial model judgements into a whole-candidate
-PASS. `max_source_bytes` bounds the complete staged diff; exceeding it fails
-closed before transport. This preserves the cross-file context needed to catch
-reference drift, protocol mismatches, and lifecycle wiring defects.
+PASS. The complete encoded prompt must fit `max_input_tokens`; otherwise it is
+rejected before transport. This preserves the cross-file context needed to catch
+reference drift, protocol mismatches, and lifecycle wiring defects without a
+second contradictory byte-based admission limit.
+
+Failure status names identify the failing domain: `INFRA_FAILED` is reserved for
+reviewer infrastructure, `CANDIDATE_REJECTED` is deterministic candidate
+preflight, and `GATE_FAILED` is local gate runtime/configuration/persistence.
 
 ## Gate seniority
 

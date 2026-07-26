@@ -6,7 +6,7 @@ Fail-closed independent code review for immutable staged Git candidates in [Herm
 
 - Reviews exactly `HEAD + INDEX_TREE`; a changed HEAD or index produces `STALE`.
 - Rejects tracked unstaged files and non-ignored untracked files.
-- Uses an explicit ordered reviewer pool restricted to approved model/transport identities; every route must be outside the configured author model families and every reviewer route must use a different model family.
+- Automatically selects reviewers from enabled `main_token_reserve.workers`, restricted to supported model/transport identities; author model families are excluded and at most one route per reviewer model family is selected.
 - Never shops for a PASS: a valid `BLOCKED` verdict is final and cannot trigger fallback.
 - Blocks sensitive paths and secret-like material before any remote request.
 - Records reviewer usage for observability but never imposes a local daily quota; provider/account limits remain authoritative.
@@ -62,9 +62,12 @@ test/build/static gates
 
 ## Configuration
 
-The ordered pool reuses named workers from `main_token_reserve.workers`. It is
-explicit configuration, not an automatic or open fallback pool. Multiple providers
-may serve an approved reviewer model so one API circuit cannot halt the gate:
+The reviewer pool is derived automatically from `main_token_reserve.workers` on
+every invocation. Disabled workers, `review_disabled: true`, unsupported identities,
+and configured author model families are skipped. Inventory order defines stable
+family priority; when duplicate routes serve the same model family, only the first
+eligible family representative enters the review chain. Circuit state is reported
+and enforced at invocation time but cannot rewrite the frozen pool identity:
 
 ```yaml
 main_token_reserve:
@@ -85,9 +88,7 @@ main_token_reserve:
       api_key_file: /opt/data/secrets/reserve_keys/kimi_review
 
 code_review:
-  workers: [grok_review, kimi_review]
   author_model_families: [gpt, claude]
-  max_source_bytes: 200000
   max_input_tokens: 120000
   max_output_tokens: 8192
 ```
@@ -117,16 +118,19 @@ cunai_k3:
 - Higher `review_max_attempts` scales the local circuit threshold so a single request
   cannot open its own circuit purely by using its configured retries.
 
-`max_source_bytes`, `max_input_tokens`, and `max_output_tokens` are per-request
-technical bounds, not daily quotas. The local usage ledger is observational only:
+`max_input_tokens` bounds the complete encoded review prompt and is the single
+authoritative input-capacity check; `max_output_tokens` bounds one response.
+They are per-request technical bounds, not daily quotas. The local usage ledger is observational only:
 it accounts for primary and fallback traffic but never blocks a normal review.
 Provider/account quotas remain the single authority for aggregate consumption.
 
 Approved identities are currently `gpt-5.6-sol/chat_completions`,
-`claude-opus-4-8/anthropic_messages`, `grok-4.5/chat_completions`, and
-`kimi-k3/chat_completions`. Approval only permits configuration; the mandatory
-`author_model_families` exclusion and reviewer-family uniqueness checks decide
-which identities may actually sign in one deployment.
+`claude-opus-5/anthropic_messages`, `grok-4.5/chat_completions`, and
+`kimi-k3/chat_completions`. Reserve inventory membership is the routing source;
+identity support only determines which enabled entries are eligible. The mandatory
+`author_model_families` exclusion and reviewer-family deduplication decide which
+identities may actually sign in one deployment. `code_review.workers` and
+`fallback_workers` are obsolete and ignored.
 Credential files must be regular files under `/opt/data/secrets/reserve_keys` with mode `0600`. Credentials, base URLs, and authorization headers are excluded from receipts and metrics.
 
 ## CLI
@@ -171,8 +175,11 @@ retry instead of blind-polling — a reviewer infrastructure outage must never
 blind the operator to *when* it clears, and never justifies a retry-storm against
 an unchanged candidate.
 
-The fallback is attempted only after retryable transport/server/rate-limit/circuit
-failure, or after one same-route retry still produces an invalid strict verdict.
+The fallback is attempted after any remote HTTP rejection, transport/timeout/
+circuit failure, or after one same-route retry still produces an invalid strict verdict.
+HTTP 4xx classes are preserved exactly (for example `HTTP_400` or `HTTP_403`)
+instead of collapsing into an opaque `HTTP_OTHER`; a preauthorized cross-family
+route may still produce a valid independent verdict when one relay rejects the request.
 Privacy, policy, stale-candidate, and valid `BLOCKED` outcomes never trigger
 fallback. The returned receipt identifies the reviewer that actually produced it.
 
@@ -188,8 +195,15 @@ Exit codes:
 
 - `0`: signed PASS and `safe_to_commit=true`
 - `2`: reviewer BLOCKED the candidate
-- `3`: infrastructure, policy, route, or stale failure
+- `3`: any non-PASS/non-BLOCKED gate result
 - `4`: invalid receipt signature
+
+Machine statuses distinguish the failure domain:
+
+- `INFRA_FAILED`: reviewer transport, rate-limit, server, timeout, circuit, or malformed-output failure;
+- `CANDIDATE_REJECTED`: deterministic local candidate preflight such as privacy, stale state, or a complete prompt over `max_input_tokens`;
+- `GATE_FAILED`: local gate configuration, signing, persistence, or runtime failure;
+- `BLOCKED`: a substantive reviewer verdict.
 
 Verify a persisted result before release:
 
@@ -200,12 +214,13 @@ hermes-code-review verify-receipt review.json \
 
 ## Large candidates
 
-A candidate larger than `max_source_bytes` fails closed before any reviewer
-request. File-boundary chunking was deliberately removed because independently
-passing chunks cannot prove cross-file reference, protocol, or lifecycle
-consistency. Split the work into independently deliverable candidates or use a
-higher-capacity preapproved route; never relabel partial review as whole-candidate
-PASS.
+The complete candidate is encoded into one prompt and checked once against
+`max_input_tokens`. File-boundary chunking was deliberately removed because
+independently passing chunks cannot prove cross-file reference, protocol, or
+lifecycle consistency. If the complete prompt is too large, the tool returns
+`CANDIDATE_REJECTED / REQUEST_TOO_LARGE`; split the work into independently
+deliverable candidates or authorize a higher-capacity route. Never relabel
+partial review as whole-candidate PASS.
 
 ## Quality benchmark
 

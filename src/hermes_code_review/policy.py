@@ -16,6 +16,10 @@ class PolicyViolation(RuntimeError):
     """A local fail-closed policy rejected the review before code left the host."""
 
 
+class CandidateViolation(PolicyViolation):
+    """The frozen candidate cannot be reviewed as submitted."""
+
+
 _SENSITIVE_NAMES = {
     '.env', 'id_rsa', 'id_ed25519', 'credentials.json', 'secrets.json',
     'service-account.json', 'auth.json',
@@ -49,10 +53,10 @@ def _sensitive_path(value: str) -> bool:
 def check_privacy(paths: list[str], diff: bytes, requirements: str, evidence: str) -> None:
     blocked = [path for path in paths if _sensitive_path(path)]
     if blocked:
-        raise PolicyViolation(f'sensitive path is not allowed in external review payload: {blocked[0]}')
+        raise CandidateViolation(f'sensitive path is not allowed in external review payload: {blocked[0]}')
     material = diff + b'\n' + requirements.encode('utf-8', errors='replace') + b'\n' + evidence.encode('utf-8', errors='replace')
     if any(pattern.search(material) for pattern in _SECRET_PATTERNS):
-        raise PolicyViolation('secret-like material detected; external review payload blocked')
+        raise CandidateViolation('secret-like material detected; external review payload blocked')
 
 
 def assert_public_payload_safe(value: object, *, forbidden: list[str]) -> None:
@@ -73,7 +77,7 @@ def estimate_tokens(text: str | bytes) -> int:
 def assert_request_bound(prompt: str, *, max_input_tokens: int) -> int:
     estimate = estimate_tokens(prompt)
     if estimate > max_input_tokens:
-        raise PolicyViolation(f'request token estimate {estimate} exceeds limit {max_input_tokens}')
+        raise CandidateViolation(f'request token estimate {estimate} exceeds limit {max_input_tokens}')
     return estimate
 
 

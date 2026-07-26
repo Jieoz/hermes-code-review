@@ -14,7 +14,7 @@ It receives no terminal, Docker, SSH, filesystem, GitHub, or secret-file access.
 
 ## Candidate state machine
 
-1. Derive the reviewer pool from enabled reserve inventory, exclude author families, validate supported model/transport identities, and select the first eligible route per reviewer family in stable inventory order.
+1. Resolve the actual author family from the active reserve chat/default route, derive the reviewer pool from enabled reserve inventory, exclude that author family, validate supported model/transport identities, and select the first eligible route per reviewer family in stable inventory order.
 2. Reject dirty tracked worktree files and non-ignored untracked files.
 3. Freeze `HEAD`, `git write-tree`, staged diff SHA, and staged paths. Those bytes and paths are the immutable review object. A best-effort guard checks Git immediately before transport, and Git is re-frozen before accepting a verdict. Concurrent changes cannot alter the already-built outbound body; they make the verdict stale and unusable. The plugin deliberately does not hold Git's index lock across a network request.
 4. Run local privacy and per-request payload-size preflight.
@@ -38,7 +38,10 @@ The route fingerprint hashes only provider name, model, normalized API mode, and
 
 Reviewer workers are discovered in reserve-inventory order and restricted to a
 local model/transport allowlist. Disabled/unsupported entries and every route in
-`author_model_families` are skipped. The first eligible route per reviewer family
+the active reserve route's model family are skipped. Thus GPT-authored candidates
+may use Opus, while Claude-authored candidates cannot. A legacy
+`author_model_families` list is used only when no active route can be resolved.
+The first eligible route per reviewer family
 enters the chain; mutable circuit state never changes that frozen identity.
 Provider diversity without cognitive model diversity is infrastructure redundancy,
 not independent judgement.

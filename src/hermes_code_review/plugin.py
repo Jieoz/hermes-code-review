@@ -36,20 +36,37 @@ STATUS_SCHEMA = {
 }
 
 
+def _author_families(cfg: dict[str, Any], settings: dict[str, Any]) -> set[str]:
+    reserve = cfg.get("main_token_reserve") or {}
+    workers = reserve.get("workers") or {}
+    route = reserve.get("route") or {}
+    active_name = route.get("chat") or route.get("default")
+    active_worker = workers.get(active_name) if isinstance(workers, dict) else None
+    if isinstance(active_worker, dict):
+        try:
+            return {core.model_family(str(active_worker.get("model") or ""))}
+        except ValueError as exc:
+            raise RuntimeError("active reserve author model family is unsupported") from exc
+
+    # Backward-compatible fail-closed fallback for deployments without an active
+    # reserve route. New deployments use the active route above as the authority.
+    configured = settings.get("author_model_families")
+    if (
+        not isinstance(configured, list)
+        or not configured
+        or not all(isinstance(value, str) and value.strip() for value in configured)
+    ):
+        raise RuntimeError("cannot prove the active author model family")
+    return {value.strip().lower() for value in configured}
+
+
 def _routes() -> tuple[list[tuple[str, dict[str, Any], dict[str, Any]]], dict[str, Any]]:
     cfg = core.load_config()
     workers = (cfg.get("main_token_reserve") or {}).get("workers") or {}
     settings = cfg.get("code_review") or {}
     if not isinstance(workers, dict) or not workers:
         raise RuntimeError("main_token_reserve.workers must contain reviewer candidates")
-    author_families = settings.get("author_model_families")
-    if (
-        not isinstance(author_families, list)
-        or not author_families
-        or not all(isinstance(value, str) and value.strip() for value in author_families)
-    ):
-        raise RuntimeError("code_review.author_model_families must be a non-empty list")
-    author_families = {value.strip().lower() for value in author_families}
+    author_families = _author_families(cfg, settings)
 
     # The reserve inventory is the single reviewer-pool authority. Select at most
     # one route per cognitive model family; duplicate endpoints are redundancy,
@@ -289,7 +306,8 @@ def review_git_candidate(args: dict, **_: Any) -> str:
 
 def _local_status_payload() -> dict:
     """Validate preapproved local routes without making a reviewer request."""
-    routes, _cfg = _routes()
+    routes, cfg = _routes()
+    author_families = sorted(_author_families(cfg, cfg.get("code_review") or {}))
     route_rows = []
     for name, _worker, snapshot in routes:
         circuit = core.circuit_state(core.STATE, snapshot["route_sha"])
@@ -319,6 +337,7 @@ def _local_status_payload() -> dict:
             "status": "ALL_ROUTES_UNAVAILABLE",
             "version": __version__,
             "selection": "reserve_pool_auto",
+            "author_families": author_families,
             "reviewer_families": [core.model_family(row["model"]) for row in route_rows],
             "worker": primary["worker"],
             "model": primary["model"],
@@ -334,6 +353,7 @@ def _local_status_payload() -> dict:
         "status": "READY",
         "version": __version__,
         "selection": "reserve_pool_auto",
+        "author_families": author_families,
         "reviewer_families": [core.model_family(row["model"]) for row in route_rows],
         "worker": primary["worker"],
         "model": primary["model"],

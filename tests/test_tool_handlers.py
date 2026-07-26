@@ -276,6 +276,26 @@ def test_review_routes_accept_current_opus_generation_from_reserve_pool(monkeypa
     ]
 
 
+def test_active_reserve_route_is_the_author_family_authority(monkeypatch):
+    from hermes_code_review import plugin
+    workers = {
+        'smart': configured_worker() | {'model': 'gpt-5.6-sol'},
+        'grok': configured_worker(),
+        'kimi': configured_kimi_worker(),
+        'opus': configured_fallback_worker() | {'model': 'claude-opus-5'},
+    }
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'main_token_reserve': {
+            'route': {'chat': 'smart', 'default': 'smart'},
+            'workers': workers,
+        },
+        # Legacy broad denylist must not exclude Opus when the actual author is GPT.
+        'code_review': {'author_model_families': ['gpt', 'claude']},
+    })
+    routes, _ = plugin._routes()
+    assert [name for name, _worker, _snapshot in routes] == ['grok', 'kimi', 'opus']
+
+
 @pytest.mark.parametrize(
     ('gate_role', 'expected_blocks'),
     [('load_bearing', True), ('secondary', False)],
@@ -527,6 +547,7 @@ def test_status_tool_is_non_secret(monkeypatch, tmp_path):
     assert value['worker'] == 'hybgzs_grok45' and value['model'] == 'grok-4.5'
     assert value['version'] == __version__
     assert value['selection'] == 'reserve_pool_auto'
+    assert value['author_families'] == ['gpt']
     assert value['reviewer_families'] == ['grok']
     assert value['usage'] == {
         'day_utc': '1970-01-01', 'input_used': 120, 'output_used': 12,

@@ -6,7 +6,7 @@ Fail-closed independent code review for immutable staged Git candidates in [Herm
 
 - Reviews exactly `HEAD + INDEX_TREE`; a changed HEAD or index produces `STALE`.
 - Rejects tracked unstaged files and non-ignored untracked files.
-- Automatically selects reviewers from enabled `main_token_reserve.workers`, restricted to supported model/transport identities; author model families are excluded and at most one route per reviewer model family is selected.
+- Automatically selects reviewers from enabled `main_token_reserve.workers`, restricted to supported model/transport identities; the active reserve chat route's actual model family is excluded and at most one route per reviewer model family is selected.
 - Never shops for a PASS: a valid `BLOCKED` verdict is final and cannot trigger fallback.
 - Blocks sensitive paths and secret-like material before any remote request.
 - Records reviewer usage for observability but never imposes a local daily quota; provider/account limits remain authoritative.
@@ -63,8 +63,10 @@ test/build/static gates
 ## Configuration
 
 The reviewer pool is derived automatically from `main_token_reserve.workers` on
-every invocation. Disabled workers, `review_disabled: true`, unsupported identities,
-and configured author model families are skipped. Inventory order defines stable
+every invocation. The active `main_token_reserve.route.chat` (or `route.default`)
+worker is the author-family authority, so a GPT-authored candidate may use Opus
+while a Claude-authored candidate may not. Disabled workers, `review_disabled: true`,
+unsupported identities, and the active author family are skipped. Inventory order defines stable
 family priority; when duplicate routes serve the same model family, only the first
 eligible family representative enters the review chain. Circuit state is reported
 and enforced at invocation time but cannot rewrite the frozen pool identity:
@@ -88,6 +90,7 @@ main_token_reserve:
       api_key_file: /opt/data/secrets/reserve_keys/kimi_review
 
 code_review:
+  # Legacy fail-closed fallback only when no active reserve route can be resolved:
   author_model_families: [gpt, claude]
   max_input_tokens: 120000
   max_output_tokens: 8192
@@ -128,8 +131,10 @@ Approved identities are currently `gpt-5.6-sol/chat_completions`,
 `claude-opus-5/anthropic_messages`, `grok-4.5/chat_completions`, and
 `kimi-k3/chat_completions`. Reserve inventory membership is the routing source;
 identity support only determines which enabled entries are eligible. The mandatory
-`author_model_families` exclusion and reviewer-family deduplication decide which
-identities may actually sign in one deployment. `code_review.workers` and
+active-author-family exclusion and reviewer-family deduplication decide which
+identities may actually sign in one deployment. `author_model_families` is consulted
+only as a fail-closed compatibility fallback when no active reserve route exists.
+`code_review.workers` and
 `fallback_workers` are obsolete and ignored.
 Credential files must be regular files under `/opt/data/secrets/reserve_keys` with mode `0600`. Credentials, base URLs, and authorization headers are excluded from receipts and metrics.
 

@@ -19,9 +19,9 @@ def valid_payload(receipt, input_tokens=20, output_tokens=5):
     return {'choices': [{'message': {'content': json.dumps(verdict)}}], 'usage': {'prompt_tokens': input_tokens, 'completion_tokens': output_tokens}}
 
 
-def test_run_review_reserves_and_reconciles_budget(tmp_path):
+def test_run_review_reserves_and_reconciles_usage(tmp_path):
     from hermes_code_review import core
-    ledger = tmp_path / 'budget.json'
+    ledger = tmp_path / 'usage.json'
 
     def transport(snapshot, body, timeout):
         prompt = body['messages'][0]['content']
@@ -37,7 +37,7 @@ def test_run_review_reserves_and_reconciles_budget(tmp_path):
 
     result = core.run_review(core.APPROVED_WORKER, worker(), b'diff', 'h', 't', transport=transport,
                              state_path=tmp_path / 'health.json', runs_dir=tmp_path / 'runs',
-                             budget_path=ledger, max_input_tokens=5000, daily_input_tokens=5000)
+                             usage_path=ledger, max_input_tokens=5000)
     assert result['verdict']['passed'] is True
     row = next(iter(json.loads(ledger.read_text())['routes'].values()))
     assert row['reserved_input_tokens'] == 0
@@ -46,7 +46,7 @@ def test_run_review_reserves_and_reconciles_budget(tmp_path):
 
 def test_run_review_retries_transient_http_and_conservatively_charges_unknown_usage(tmp_path):
     from hermes_code_review import core
-    ledger = tmp_path / 'budget.json'
+    ledger = tmp_path / 'usage.json'
     calls = 0
 
     def transport(snapshot, body, timeout):
@@ -77,8 +77,7 @@ def test_run_review_retries_transient_http_and_conservatively_charges_unknown_us
         core.APPROVED_WORKER, worker(), b'diff', 'h', 't',
         transport=transport, attempts=2, sleep=lambda _: None,
         state_path=tmp_path / 'health.json', runs_dir=tmp_path / 'runs',
-        budget_path=ledger, max_input_tokens=5000, max_output_tokens=100,
-        daily_input_tokens=5000,
+        usage_path=ledger, max_input_tokens=5000, max_output_tokens=100,
     )
 
     assert calls == 2
@@ -92,7 +91,7 @@ def test_run_review_retries_transient_http_and_conservatively_charges_unknown_us
 
 def test_run_review_retries_one_invalid_verdict_and_accounts_for_both_responses(tmp_path):
     from hermes_code_review import core
-    ledger = tmp_path / 'budget.json'
+    ledger = tmp_path / 'usage.json'
     calls = 0
 
     def transport(snapshot, body, timeout):
@@ -118,7 +117,7 @@ def test_run_review_retries_one_invalid_verdict_and_accounts_for_both_responses(
         core.APPROVED_WORKER, worker(), b'diff', 'h', 't',
         transport=transport, attempts=2, sleep=lambda _: None,
         state_path=tmp_path / 'health.json', runs_dir=tmp_path / 'runs',
-        budget_path=ledger, max_input_tokens=5000, daily_input_tokens=5000,
+        usage_path=ledger, max_input_tokens=5000,
     )
 
     assert calls == 2
@@ -138,7 +137,7 @@ def test_run_review_rejects_over_cap_before_transport(tmp_path):
     with pytest.raises(RuntimeError, match='request token estimate'):
         core.run_review(core.APPROVED_WORKER, worker(), b'x' * 1000, 'h', 't', transport=transport,
                         state_path=tmp_path / 'health.json', runs_dir=tmp_path / 'runs',
-                        budget_path=tmp_path / 'budget.json', max_input_tokens=10, daily_input_tokens=5000)
+                        usage_path=tmp_path / 'usage.json', max_input_tokens=10)
     assert called is False
 
 
@@ -189,15 +188,14 @@ def test_git_review_signs_before_persisting(tmp_path, monkeypatch):
 def test_malformed_response_without_usage_charges_full_reservation(tmp_path):
     from hermes_code_review import core
 
-    ledger = tmp_path / 'budget.json'
+    ledger = tmp_path / 'usage.json'
     with pytest.raises(core.InvalidVerdictError):
         core.run_review(
             core.APPROVED_WORKER, worker(), b'+safe = True\n', 'head', 'tree',
             attempts=1,
             transport=lambda snapshot, body, timeout: {'malformed': True},
             state_path=tmp_path / 'health.json', runs_dir=tmp_path / 'runs',
-            budget_path=ledger, max_input_tokens=1000, max_output_tokens=77,
-            daily_input_tokens=1000, daily_output_tokens=1000,
+            usage_path=ledger, max_input_tokens=1000, max_output_tokens=77,
         )
     value = json.loads(ledger.read_text())
     row = next(iter(value['routes'].values()))
@@ -253,15 +251,14 @@ def test_nonretryable_http_does_not_open_circuit_or_enable_later_fallback(tmp_pa
 def test_missing_usage_is_invalid_and_conservatively_reconciled(tmp_path):
     from hermes_code_review import core
 
-    ledger = tmp_path / 'budget.json'
+    ledger = tmp_path / 'usage.json'
     payload = {'choices': [{'message': {'content': '{}'}}], 'usage': {}}
     with pytest.raises(core.InvalidVerdictError):
         core.run_review(
             core.APPROVED_WORKER, worker(), b'+safe = True\n', 'head', 'tree',
             attempts=1, transport=lambda snapshot, body, timeout: payload,
             state_path=tmp_path / 'health.json', runs_dir=tmp_path / 'runs',
-            budget_path=ledger, max_input_tokens=1000, max_output_tokens=55,
-            daily_input_tokens=1000, daily_output_tokens=1000,
+            usage_path=ledger, max_input_tokens=1000, max_output_tokens=55,
         )
     row = next(iter(json.loads(ledger.read_text())['routes'].values()))
     assert row['reserved_input_tokens'] == 0
@@ -272,7 +269,7 @@ def test_missing_usage_is_invalid_and_conservatively_reconciled(tmp_path):
 def test_local_pretransport_validation_error_is_refunded_and_not_retyped(tmp_path):
     from hermes_code_review import core
 
-    ledger = tmp_path / 'budget.json'
+    ledger = tmp_path / 'usage.json'
     calls = 0
 
     def guard():
@@ -285,9 +282,8 @@ def test_local_pretransport_validation_error_is_refunded_and_not_retyped(tmp_pat
         core.run_review(
             core.APPROVED_WORKER, worker(), b'+safe = True\n', 'head', 'tree',
             candidate_guard=guard, state_path=tmp_path / 'health.json',
-            runs_dir=tmp_path / 'runs', budget_path=ledger,
+            runs_dir=tmp_path / 'runs', usage_path=ledger,
             max_output_tokens=100,
-            daily_input_tokens=1000, daily_output_tokens=1000,
         )
     row = next(iter(json.loads(ledger.read_text())['routes'].values()))
     assert row['reserved_input_tokens'] == 0
@@ -299,7 +295,7 @@ def test_local_pretransport_validation_error_is_refunded_and_not_retyped(tmp_pat
 def test_wrong_typed_usage_is_rejected_and_conservatively_charged(tmp_path, bad_usage):
     from hermes_code_review import core
 
-    ledger = tmp_path / 'budget.json'
+    ledger = tmp_path / 'usage.json'
 
     def transport(snapshot, body, timeout):
         prompt = body['messages'][0]['content']
@@ -320,8 +316,7 @@ def test_wrong_typed_usage_is_rejected_and_conservatively_charged(tmp_path, bad_
             core.APPROVED_WORKER, worker(), b'+safe = True\n', 'head', 'tree',
             attempts=1, transport=transport,
             state_path=tmp_path / 'health.json', runs_dir=tmp_path / 'runs',
-            budget_path=ledger, max_input_tokens=1000, max_output_tokens=66,
-            daily_input_tokens=1000, daily_output_tokens=1000,
+            usage_path=ledger, max_input_tokens=1000, max_output_tokens=66,
         )
     row = next(iter(json.loads(ledger.read_text())['routes'].values()))
     assert row['input_tokens'] > 0

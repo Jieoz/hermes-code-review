@@ -43,8 +43,8 @@ def classify_error(message: str) -> str:
         return 'INVALID_VERDICT'
     if 'circuit open' in text:
         return 'CIRCUIT_OPEN'
-    if 'budget' in text:
-        return 'BUDGET'
+    if 'usage ledger' in text or 'usage reservation' in text:
+        return 'USAGE_LEDGER'
     if 'secret' in text or 'sensitive path' in text:
         return 'PRIVACY'
     return 'OTHER'

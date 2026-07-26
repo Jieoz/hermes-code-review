@@ -9,7 +9,7 @@ Fail-closed independent code review for immutable staged Git candidates in [Herm
 - Uses an explicit ordered reviewer pool restricted to approved model/transport identities; every route must be outside the configured author model families and every reviewer route must use a different model family.
 - Never shops for a PASS: a valid `BLOCKED` verdict is final and cannot trigger fallback.
 - Blocks sensitive paths and secret-like material before any remote request.
-- Applies shared 1,000,000-input / 200,000-output daily caps by default and protects 200,000 input plus 40,000 output tokens for final releases; operators may override these values explicitly.
+- Records reviewer usage for observability but never imposes a local daily quota; provider/account limits remain authoritative.
 - Reviews the complete staged diff as one semantic unit. Oversized candidates fail closed instead of producing context-losing partial PASSes.
 - Requires strict JSON findings with valid `file:line` for P0/P1.
 - Binds receipts to requirements and evidence hashes, then signs them locally with HMAC.
@@ -90,10 +90,6 @@ code_review:
   max_source_bytes: 200000
   max_input_tokens: 120000
   max_output_tokens: 8192
-  daily_input_tokens: 1000000
-  daily_output_tokens: 200000
-  release_input_reserve: 200000
-  release_output_reserve: 40000
 ```
 
 Per-route transport knobs (not part of reviewer identity / `route_sha`) may be set
@@ -121,11 +117,10 @@ cunai_k3:
 - Higher `review_max_attempts` scales the local circuit threshold so a single request
   cannot open its own circuit purely by using its configured retries.
 
-`max_input_tokens` and `max_output_tokens` are per-request payload bounds. Daily
-limits are shared across the whole ordered pool, so fallback never creates a
-second allowance. Both input and output keep protected release reserves;
-routine reviews cannot consume them. Explicit zero still means unlimited, but
-omission uses the bounded defaults above.
+`max_source_bytes`, `max_input_tokens`, and `max_output_tokens` are per-request
+technical bounds, not daily quotas. The local usage ledger is observational only:
+it accounts for primary and fallback traffic but never blocks a normal review.
+Provider/account quotas remain the single authority for aggregate consumption.
 
 Approved identities are currently `gpt-5.6-sol/chat_completions`,
 `claude-opus-4-8/anthropic_messages`, `grok-4.5/chat_completions`, and
@@ -149,12 +144,8 @@ hermes-code-review status
 hermes-code-review review-git \
   --repo /path/to/repo \
   --requirements 'Describe the intended behavior and release criteria.' \
-  --evidence 'pytest, lint, type-check and security-scan results' \
-  --release-gate
+  --evidence 'pytest, lint, type-check and security-scan results'
 ```
-
-`--release-gate` allows a final tag, Release, or deployment review to consume
-the protected release reserve. Ordinary review cannot consume it.
 
 `gate_role` makes project seniority explicit:
 
@@ -174,7 +165,7 @@ reviewer service.
 
 When **every** route's local circuit is open, `status` does not collapse to an
 opaque failure. It returns `status: ALL_ROUTES_UNAVAILABLE` with each route's
-identity, budget, per-route `open_until`, and a top-level `retry_after_seconds`
+identity, observed usage, per-route `open_until`, and a top-level `retry_after_seconds`
 giving the soonest cooldown lapse. This lets the caller schedule a single spaced
 retry instead of blind-polling — a reviewer infrastructure outage must never
 blind the operator to *when* it clears, and never justifies a retry-storm against
@@ -182,7 +173,7 @@ an unchanged candidate.
 
 The fallback is attempted only after retryable transport/server/rate-limit/circuit
 failure, or after one same-route retry still produces an invalid strict verdict.
-Privacy, budget, policy, stale-candidate, and valid `BLOCKED` outcomes never trigger
+Privacy, policy, stale-candidate, and valid `BLOCKED` outcomes never trigger
 fallback. The returned receipt identifies the reviewer that actually produced it.
 
 ## Signed PASS reuse
@@ -197,7 +188,7 @@ Exit codes:
 
 - `0`: signed PASS and `safe_to_commit=true`
 - `2`: reviewer BLOCKED the candidate
-- `3`: infrastructure, policy, budget, route, or stale failure
+- `3`: infrastructure, policy, route, or stale failure
 - `4`: invalid receipt signature
 
 Verify a persisted result before release:

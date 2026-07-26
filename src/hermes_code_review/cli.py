@@ -17,10 +17,6 @@ def _parser() -> argparse.ArgumentParser:
     review.add_argument("--requirements", required=True)
     review.add_argument("--evidence", required=True)
     review.add_argument("--timeout", type=int, default=240)
-    review.add_argument(
-        "--release-gate", action="store_true",
-        help="Allow this final release review to consume the protected release reserve",
-    )
 
     verify = sub.add_parser("verify-receipt", help="Verify a signed review result")
     verify.add_argument("result")
@@ -38,7 +34,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "requirements": args.requirements,
             "evidence": args.evidence,
             "timeout": args.timeout,
-            "release_gate": args.release_gate,
         }))
         status = result.get("status")
         signature_valid = False

@@ -45,7 +45,6 @@ def test_fallback_policy_accepts_only_infrastructure_classes():
     assert plugin._fallback_eligible(core.ReviewHTTPError(503, 'down')) is True
     assert plugin._fallback_eligible(core.ReviewTransportError('network transport failed')) is True
     assert plugin._fallback_eligible(core.InvalidVerdictError('invalid review verdict')) is True
-    assert plugin._fallback_eligible(policy.PolicyViolation('daily review budget exhausted')) is False
     assert plugin._fallback_eligible(policy.PolicyViolation('secret-like material')) is False
     assert plugin._fallback_eligible(RuntimeError('stale review verdict')) is False
     assert plugin._fallback_eligible(core.ReviewHTTPError(403, 'forbidden')) is False
@@ -72,18 +71,18 @@ def test_review_tool_returns_machine_pass(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin.core, 'run_git_review', fake_run)
     value = json.loads(plugin.review_git_candidate({
         'repo': str(tmp_path), 'requirements': 'r', 'evidence': 'e',
-        'release_gate': True,
     }))
     assert value['status'] == 'PASS'
     assert value['receipt']['reviewer_model'] == 'grok-4.5'
     assert seen['signing_key_path'] == plugin.SIGNING_KEY
     assert seen['max_source_bytes'] == 350_000
     assert seen['max_output_tokens'] == 8_192
-    assert seen['daily_input_tokens'] == 1_000_000
-    assert seen['daily_output_tokens'] == 200_000
-    assert seen['release_input_reserve'] == 200_000
-    assert seen['release_output_reserve'] == 40_000
-    assert seen['allow_release_reserve'] is True
+    assert seen['usage_path'] == plugin.core.USAGE_LEDGER
+    assert not {
+        'daily_input_tokens', 'daily_output_tokens',
+        'release_input_reserve', 'release_output_reserve',
+        'allow_release_reserve',
+    }.intersection(seen)
     event = json.loads(plugin.METRICS.read_text())
     assert event['status'] == 'PASS' and event['route_sha'] == 'route'
     assert 'secret' not in json.dumps(value)
@@ -281,18 +280,6 @@ def test_explicit_zero_per_request_bound_is_rejected():
         plugin._positive_setting({'max_input_tokens': '120000'}, 'max_input_tokens', 120_000)
 
 
-@pytest.mark.parametrize('bad_value', [False, 0.5, '1000', [], -1])
-def test_malformed_optional_daily_cap_is_rejected_not_treated_as_unlimited(bad_value):
-    from hermes_code_review import plugin
-    with pytest.raises(RuntimeError, match='must be a nonnegative integer'):
-        plugin._nonnegative_setting({'daily_input_tokens': bad_value}, 'daily_input_tokens')
-
-
-def test_explicit_integer_zero_daily_cap_remains_unlimited_sentinel():
-    from hermes_code_review import plugin
-    assert plugin._nonnegative_setting({'daily_input_tokens': 0}, 'daily_input_tokens') == 0
-
-
 def test_review_tool_reuses_exact_signed_pass_without_remote_call(monkeypatch, tmp_path):
     from hermes_code_review import core, plugin
     monkeypatch.setattr(plugin, 'SIGNING_KEY', tmp_path / 'receipt.key')
@@ -434,10 +421,10 @@ def test_public_result_is_whitelisted_and_rejects_known_credential(monkeypatch, 
 
 def test_status_tool_is_non_secret(monkeypatch, tmp_path):
     from hermes_code_review import __version__, core, plugin
-    monkeypatch.setattr(plugin.core, 'BUDGET', tmp_path / 'budget.json')
+    monkeypatch.setattr(plugin.core, 'USAGE_LEDGER', tmp_path / 'usage.json')
     monkeypatch.setattr(plugin.core.time, 'time', lambda: 1000)
     snapshot = core.worker_snapshot(core.APPROVED_WORKER, configured_worker())
-    (tmp_path / 'budget.json').write_text(json.dumps({
+    (tmp_path / 'usage.json').write_text(json.dumps({
         'day': '1970-01-01',
         'routes': {snapshot['route_sha']: {
             'input_tokens': 100, 'output_tokens': 10,
@@ -448,12 +435,7 @@ def test_status_tool_is_non_secret(monkeypatch, tmp_path):
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
         'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
         'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
-        'code_review': {
-            'daily_input_tokens': 1000, 'daily_output_tokens': 100,
-            'release_input_reserve': 200,
-            'release_output_reserve': 20,
-            'author_model_families': ['gpt'],
-        },
+        'code_review': {'author_model_families': ['gpt']},
     })
     monkeypatch.setattr(
         plugin.core, '_request_json',
@@ -463,38 +445,32 @@ def test_status_tool_is_non_secret(monkeypatch, tmp_path):
     assert value['status'] == 'READY'
     assert value['worker'] == 'hybgzs_grok45' and value['model'] == 'grok-4.5'
     assert value['version'] == __version__
-    assert value['budget'] == {
-        'day_utc': '1970-01-01', 'input_used': 120, 'input_remaining': 880,
-        'routine_input_remaining': 680, 'release_input_reserve': 200,
-        'output_used': 12, 'output_remaining': 88,
-        'routine_output_remaining': 68, 'release_output_reserve': 20,
-        'reset_at': '1970-01-02T00:00:00Z',
+    assert value['usage'] == {
+        'day_utc': '1970-01-01', 'input_used': 120, 'output_used': 12,
     }
     assert 'secret' not in json.dumps(value)
 
 
-def test_status_tool_defaults_to_bounded_daily_usage_with_release_reserve(monkeypatch, tmp_path):
+def test_status_tool_reports_usage_without_local_remaining_quota(monkeypatch, tmp_path):
     from hermes_code_review import plugin
-    monkeypatch.setattr(plugin.core, 'BUDGET', tmp_path / 'budget.json')
+    monkeypatch.setattr(plugin.core, 'USAGE_LEDGER', tmp_path / 'usage.json')
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
         'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
         'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
         'code_review': {'author_model_families': ['gpt']},
     })
     value = json.loads(plugin.code_review_status({}))
-    assert value['budget']['input_remaining'] == 1_000_000
-    assert value['budget']['routine_input_remaining'] == 800_000
-    assert value['budget']['output_remaining'] == 200_000
-    assert value['budget']['routine_output_remaining'] == 160_000
-    assert value['budget']['reset_at'] is not None
-    assert value['budget']['release_input_reserve'] == 200_000
-    assert value['budget']['release_output_reserve'] == 40_000
+    assert value['usage'] == {
+        'day_utc': value['usage']['day_utc'], 'input_used': 0, 'output_used': 0,
+    }
+    assert 'input_remaining' not in value['usage']
+    assert 'output_remaining' not in value['usage']
 
 
 def test_status_tool_uses_ready_fallback_when_primary_circuit_is_open(monkeypatch, tmp_path):
     from hermes_code_review import core, plugin
     monkeypatch.setattr(plugin.core, 'STATE', tmp_path / 'health.json')
-    monkeypatch.setattr(plugin.core, 'BUDGET', tmp_path / 'budget.json')
+    monkeypatch.setattr(plugin.core, 'USAGE_LEDGER', tmp_path / 'usage.json')
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
         'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
         'main_token_reserve': {'workers': {
@@ -524,14 +500,14 @@ def test_status_tool_stays_truthful_when_all_routes_circuit_open(monkeypatch, tm
 
     Regression: the status tool used to raise and return a bare
     {status: INFRA_FAILED, error_class: CIRCUIT_OPEN}, discarding route
-    identities, budgets, and — critically — when the cooldown lapses. That
+    identities, usage, and — critically — when the cooldown lapses. That
     blinded the operator to *when* to retry and invited retry-storms. The tool
     must instead report ALL_ROUTES_UNAVAILABLE with per-route status and the
     soonest retry_after_seconds.
     """
     from hermes_code_review import __version__, core, plugin
     monkeypatch.setattr(plugin.core, 'STATE', tmp_path / 'health.json')
-    monkeypatch.setattr(plugin.core, 'BUDGET', tmp_path / 'budget.json')
+    monkeypatch.setattr(plugin.core, 'USAGE_LEDGER', tmp_path / 'usage.json')
     monkeypatch.setattr(plugin.core, 'load_config', lambda: {
         'delegation': {'lanes': {'critic': {'worker': 'hybgzs_grok45'}}},
         'main_token_reserve': {'workers': {'hybgzs_grok45': configured_worker()}},
@@ -553,7 +529,7 @@ def test_status_tool_stays_truthful_when_all_routes_circuit_open(monkeypatch, tm
     assert value['version'] == __version__
     # Truthful cooldown: 300s cooldown opened at t=100, now t=101 -> ~299s left.
     assert value['retry_after_seconds'] == 299
-    assert 'budget' in value
+    assert 'usage' in value
 
 
 def test_status_tool_sanitizes_route_failures_and_never_probes_network(monkeypatch):

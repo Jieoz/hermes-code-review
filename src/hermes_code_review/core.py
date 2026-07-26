@@ -30,7 +30,7 @@ HERMES_HOME = Path(os.environ.get('HERMES_HOME', '/opt/data')).resolve()
 CONFIG = HERMES_HOME / 'config.yaml'
 STATE = HERMES_HOME / 'state/review_worker_health.json'
 RUNS = HERMES_HOME / 'state/review_runs'
-BUDGET = HERMES_HOME / 'state/review_budget.json'
+USAGE_LEDGER = HERMES_HOME / 'state/review_usage.json'
 RESERVE_KEY_DIR = HERMES_HOME / 'secrets/reserve_keys'
 APPROVED_WORKER = 'hybgzs_grok45'
 APPROVED_MODEL = 'grok-4.5'
@@ -477,11 +477,8 @@ def find_cached_pass(runs_dir: Path, *, frozen: dict, route_snapshots: list[dict
 def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: str, *,
                requirements: str = '', evidence: str = '', attempts: int = 2, timeout: int = 180,
                state_path: Path = STATE, runs_dir: Path = RUNS, transport=None, sleep=time.sleep,
-               current_worker=None, persist: bool = True, budget_path: Path | None = None,
-               max_input_tokens: int = 120_000, daily_input_tokens: int = 0,
-               max_output_tokens: int = 8_192, daily_output_tokens: int = 0,
-               release_input_reserve: int = 0, release_output_reserve: int = 0,
-               allow_release_reserve: bool = False,
+               current_worker=None, persist: bool = True, usage_path: Path | None = None,
+               max_input_tokens: int = 120_000, max_output_tokens: int = 8_192,
                candidate_guard=None) -> dict:
     snapshot = worker_snapshot(name, worker)
     route_sha = snapshot['route_sha']
@@ -497,7 +494,7 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
         requirements=requirements, evidence=evidence,
     )
     prompt = build_review_prompt(source, receipt, requirements=requirements, evidence=evidence)
-    estimated_tokens = policy.assert_request_budget(prompt, max_input_tokens=max_input_tokens)
+    estimated_tokens = policy.assert_request_bound(prompt, max_input_tokens=max_input_tokens)
     body = _review_body(snapshot, prompt, max_output_tokens)
     transport = transport or _request_json
     started = time.monotonic()
@@ -527,25 +524,20 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
         reservation = None
         input_tokens = output_tokens = 0
         usage_known = False
-        if budget_path is not None:
-            reservation = policy.reserve_budget(
-                budget_path, route_sha=route_sha,
+        if usage_path is not None:
+            reservation = policy.reserve_usage(
+                usage_path, route_sha=route_sha,
                 estimated_input_tokens=estimated_tokens,
                 estimated_output_tokens=max_output_tokens,
-                daily_input_limit=daily_input_tokens,
-                daily_output_limit=daily_output_tokens,
-                release_input_reserve=release_input_reserve,
-                release_output_reserve=release_output_reserve,
-                allow_release_reserve=allow_release_reserve,
             )
         try:
             assert_worker_current()
             if candidate_guard is not None:
                 candidate_guard()
         except Exception:
-            if budget_path is not None and reservation is not None:
-                policy.reconcile_budget(
-                    budget_path, reservation, actual_input_tokens=0, actual_output_tokens=0,
+            if usage_path is not None and reservation is not None:
+                policy.reconcile_usage(
+                    usage_path, reservation, actual_input_tokens=0, actual_output_tokens=0,
                 )
             raise
         try:
@@ -559,9 +551,9 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
             # chat and messages APIs — never a soft PASS.
             verdict = parse_strict_verdict(raw, receipt, allow_recovery=True)
         except ReviewHTTPError as exc:
-            if budget_path is not None and reservation is not None:
-                policy.reconcile_budget(
-                    budget_path, reservation,
+            if usage_path is not None and reservation is not None:
+                policy.reconcile_usage(
+                    usage_path, reservation,
                     actual_input_tokens=estimated_tokens, actual_output_tokens=max_output_tokens,
                 )
             total_input_tokens += estimated_tokens
@@ -574,9 +566,9 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
             sleep(min(backoff_cap, (2 ** (attempt - 1)) + random.random()))
             continue
         except (urllib.error.URLError, TimeoutError, OSError):
-            if budget_path is not None and reservation is not None:
-                policy.reconcile_budget(
-                    budget_path, reservation,
+            if usage_path is not None and reservation is not None:
+                policy.reconcile_usage(
+                    usage_path, reservation,
                     actual_input_tokens=estimated_tokens, actual_output_tokens=max_output_tokens,
                 )
             total_input_tokens += estimated_tokens
@@ -589,9 +581,9 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
         except (ValueError, TypeError, KeyError):
             charged_input = input_tokens if usage_known else estimated_tokens
             charged_output = output_tokens if usage_known else max_output_tokens
-            if budget_path is not None and reservation is not None:
-                policy.reconcile_budget(
-                    budget_path, reservation,
+            if usage_path is not None and reservation is not None:
+                policy.reconcile_usage(
+                    usage_path, reservation,
                     actual_input_tokens=charged_input, actual_output_tokens=charged_output,
                 )
             total_input_tokens += charged_input
@@ -602,9 +594,9 @@ def run_review(name: str, worker: dict, source: bytes, head: str, index_tree: st
             sleep(min(backoff_cap, (2 ** (attempt - 1)) + random.random()))
             continue
 
-        if budget_path is not None and reservation is not None:
-            policy.reconcile_budget(
-                budget_path, reservation,
+        if usage_path is not None and reservation is not None:
+            policy.reconcile_usage(
+                usage_path, reservation,
                 actual_input_tokens=input_tokens, actual_output_tokens=output_tokens,
             )
         total_input_tokens += input_tokens
@@ -682,11 +674,8 @@ def freeze_git_candidate(repo: Path | str) -> dict:
 def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: str = '',
                    evidence: str = '', attempts: int = 1, timeout: int = 240,
                    state_path: Path = STATE, runs_dir: Path = RUNS, current_worker=None,
-                   runner=run_review, budget_path: Path | None = None,
-                   max_input_tokens: int = 120_000, daily_input_tokens: int = 0,
-                   max_output_tokens: int = 8_192, daily_output_tokens: int = 0,
-                   release_input_reserve: int = 0, release_output_reserve: int = 0,
-                   allow_release_reserve: bool = False,
+                   runner=run_review, usage_path: Path | None = None,
+                   max_input_tokens: int = 120_000, max_output_tokens: int = 8_192,
                    signing_key_path: Path | None = None,
                    max_source_bytes: int = 350_000,
                    expected_candidate: dict | None = None) -> dict:
@@ -738,12 +727,8 @@ def run_git_review(repo: Path | str, name: str, worker: dict, *, requirements: s
         requirements=requirements, evidence=evidence,
         attempts=attempts, timeout=timeout,
         state_path=state_path, runs_dir=runs_dir, current_worker=current_worker, persist=False,
-        budget_path=budget_path, max_input_tokens=max_input_tokens,
-        daily_input_tokens=daily_input_tokens,
-        max_output_tokens=max_output_tokens, daily_output_tokens=daily_output_tokens,
-        release_input_reserve=release_input_reserve,
-        release_output_reserve=release_output_reserve,
-        allow_release_reserve=allow_release_reserve,
+        usage_path=usage_path, max_input_tokens=max_input_tokens,
+        max_output_tokens=max_output_tokens,
         candidate_guard=candidate_guard,
     )
     validate_finding_references(

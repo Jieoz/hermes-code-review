@@ -31,7 +31,7 @@ def test_plugin_registers_first_class_review_tools():
     assert set(by_name) == {'review_git_candidate', 'code_review_status'}
     assert by_name['review_git_candidate']['toolset'] == 'code_review'
     assert by_name['review_git_candidate']['schema']['parameters']['required'] == ['repo']
-    assert by_name['review_git_candidate']['schema']['parameters']['properties']['release_gate']['type'] == 'boolean'
+    assert 'release_gate' not in by_name['review_git_candidate']['schema']['parameters']['properties']
     assert by_name['review_git_candidate'].get('override') is not True
 
 
@@ -65,6 +65,7 @@ def test_repo_cli_launcher_resolves_symlink_and_reports_ready(tmp_path):
     import json
     import os
     import subprocess
+    from hermes_code_review import __version__
 
     root = Path(__file__).parents[1]
     launcher = root / 'scripts' / 'hermes-code-review'
@@ -123,5 +124,5 @@ main_token_reserve:
     payload = json.loads(result.stdout)
     assert result.returncode == 0
     assert payload['status'] == 'READY'
-    assert payload['version'] == '0.3.0'
+    assert payload['version'] == __version__
     assert payload['fallback'] == 'fail'

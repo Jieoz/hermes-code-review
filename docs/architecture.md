@@ -2,7 +2,7 @@
 
 ## Trust boundary
 
-The local Hermes process owns Git inspection, secret scanning, budget reservation, candidate identity, result validation, persistence, signing, and metrics. The remote reviewer receives only:
+The local Hermes process owns Git inspection, secret scanning, usage accounting, candidate identity, result validation, persistence, signing, and metrics. The remote reviewer receives only:
 
 - staged unified diff bytes;
 - explicit acceptance criteria;
@@ -30,7 +30,7 @@ The release owner invokes this gate proactively after all deterministic checks a
 before commit/push/release. The gate covers only the staged HEAD + index tree it
 receives. Any code, test, documentation, packaging, or staging change invalidates
 the prior verdict. Read-only investigation and incomplete work are intentionally
-outside the gate so reviewer budget is spent only on final candidates.
+outside the gate so substantive reviewer requests are spent only on final candidates.
 
 ## Route identity
 
@@ -41,8 +41,8 @@ model/transport allowlist. Every route must be outside `author_model_families`,
 and no two routes may share a model family. Provider diversity without cognitive
 model diversity is not treated as independent review.
 Fallback is permitted only for infrastructure classes (including one exhausted
-same-route invalid-verdict retry). A valid `BLOCKED`, privacy failure, budget
-failure, policy failure, or stale candidate is final and cannot select another
+same-route invalid-verdict retry). A valid `BLOCKED`, privacy failure, policy
+failure, or stale candidate is final and cannot select another
 reviewer. Fallback therefore improves availability without shopping for a PASS.
 
 Per-route transport knobs (`review_json_mode`, `review_max_attempts`,
@@ -52,11 +52,11 @@ When JSON mode is disabled, response recovery may extract a bare JSON object fro
 fenced/padded text, but the extracted value still must pass the full strict
 verdict schema.
 
-The default shared daily budget is 1,000,000 input and 200,000 output tokens,
-with 200,000 input and 40,000 output tokens protected for explicit release
-reviews. Operator-defined overrides are global across all routes, so switching
-to the fallback cannot create a second allowance. Explicit zero is the deliberate
-unlimited override.
+The usage ledger atomically reserves and reconciles primary and fallback traffic
+for observability. It has no local daily cap and cannot block a normal review.
+Aggregate quota enforcement belongs to the configured provider/account. Local
+limits exist only for one request (`max_source_bytes`, `max_input_tokens`, and
+`max_output_tokens`) so impossible payloads fail before transport.
 
 ## Full-context review
 

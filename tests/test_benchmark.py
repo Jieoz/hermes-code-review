@@ -46,9 +46,10 @@ def test_live_benchmark_uses_one_fixed_route_and_reports_recall(monkeypatch):
         return {"verdict": {"p0": [], "p1": [{"file": "a.py", "line": 1, "issue": "shell injection"}]}, "receipt": {}, "metrics": {}}
     result = benchmark.run_benchmark(cases, "hybgzs_grok45", configured_worker(), runner=runner)
     assert seen["reviewer"] == "hybgzs_grok45"
-    assert seen["budget_path"] == core.BUDGET
-    assert {"max_input_tokens", "daily_input_tokens", "max_output_tokens",
-            "daily_output_tokens"}.issubset(seen)
+    assert seen["usage_path"] == core.USAGE_LEDGER
+    assert {"max_input_tokens", "max_output_tokens"}.issubset(seen)
+    assert "daily_input_tokens" not in seen
+    assert "daily_output_tokens" not in seen
     assert result["evaluation"]["recall"] == 1.0
 
 
@@ -68,7 +69,7 @@ def test_benchmark_rejects_wrong_route_before_runner():
     assert called is False
 
 
-def test_benchmark_rejects_nonpositive_budget_before_runner():
+def test_benchmark_rejects_nonpositive_request_bounds_before_runner():
     import pytest
     from hermes_code_review import benchmark
     called = False

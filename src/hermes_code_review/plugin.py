@@ -19,7 +19,6 @@ REVIEW_SCHEMA = {
             "repo": {"type": "string", "description": "Absolute path to a Git repository with the intended candidate staged."},
             "requirements": {"type": "string", "description": "Acceptance criteria."},
             "evidence": {"type": "string", "description": "Deterministic test/static evidence to scrutinize."},
-            "release_gate": {"type": "boolean", "description": "Allow this final tag, release, or deployment review to consume the protected release budget reserve."},
             "gate_role": {
                 "type": "string",
                 "enum": ["load_bearing", "secondary"],
@@ -137,13 +136,6 @@ def _positive_setting(settings: dict[str, Any], key: str, default: int) -> int:
     return value
 
 
-def _nonnegative_setting(settings: dict[str, Any], key: str, default: int = 0) -> int:
-    value = default if key not in settings else settings[key]
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise RuntimeError(f"code_review.{key} must be a nonnegative integer")
-    return value
-
-
 def _public_result(result: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
     receipt_keys = (
         "review_head", "review_index_tree", "review_diff_sha",
@@ -198,14 +190,9 @@ def review_git_candidate(args: dict, **_: Any) -> str:
                     attempts=2,
                     timeout=max(1, min(int(args.get("timeout") or 240), 600)),
                     current_worker=lambda route_name=name: _current_pool_worker(expected_pool, route_name),
-                    budget_path=core.BUDGET,
+                    usage_path=core.USAGE_LEDGER,
                     max_input_tokens=_positive_setting(settings, "max_input_tokens", 120_000),
-                    daily_input_tokens=_nonnegative_setting(settings, "daily_input_tokens", 1_000_000),
                     max_output_tokens=_positive_setting(settings, "max_output_tokens", 8_192),
-                    daily_output_tokens=_nonnegative_setting(settings, "daily_output_tokens", 200_000),
-                    release_input_reserve=_nonnegative_setting(settings, "release_input_reserve", 200_000),
-                    release_output_reserve=_nonnegative_setting(settings, "release_output_reserve", 40_000),
-                    allow_release_reserve=args.get("release_gate") is True,
                     signing_key_path=SIGNING_KEY,
                     max_source_bytes=_positive_setting(settings, "max_source_bytes", 350_000),
                     expected_candidate=invocation_frozen,
@@ -282,12 +269,7 @@ def review_git_candidate(args: dict, **_: Any) -> str:
 
 def _local_status_payload() -> dict:
     """Validate preapproved local routes without making a reviewer request."""
-    routes, cfg = _routes()
-    settings = cfg.get("code_review") or {}
-    daily_input = _nonnegative_setting(settings, "daily_input_tokens", 1_000_000)
-    daily_output = _nonnegative_setting(settings, "daily_output_tokens", 200_000)
-    release_reserve = _nonnegative_setting(settings, "release_input_reserve", 200_000)
-    release_output_reserve = _nonnegative_setting(settings, "release_output_reserve", 40_000)
+    routes, _cfg = _routes()
     route_rows = []
     for name, _worker, snapshot in routes:
         circuit = core.circuit_state(core.STATE, snapshot["route_sha"])
@@ -297,14 +279,7 @@ def _local_status_payload() -> dict:
             "api_mode": snapshot["api_mode"],
             "route_sha": snapshot["route_sha"],
             "status": circuit["status"],
-            "budget": policy.budget_status(
-                core.BUDGET,
-                route_sha=snapshot["route_sha"],
-                daily_input_limit=daily_input,
-                daily_output_limit=daily_output,
-                release_input_reserve=release_reserve,
-                release_output_reserve=release_output_reserve,
-            ),
+            "usage": policy.usage_status(core.USAGE_LEDGER),
         }
         if circuit["status"] == "CIRCUIT_OPEN":
             row["open_until"] = circuit["open_until"]
@@ -315,7 +290,7 @@ def _local_status_payload() -> dict:
     any_ready = any(row["status"] == "READY" for row in route_rows)
     if not any_ready:
         # Every route's circuit is open. Do NOT collapse to an opaque failure:
-        # stay truthful so the caller sees each route identity, budget, and —
+        # stay truthful so the caller sees each route identity, usage, and —
         # critically — the earliest cooldown lapse, so a spaced retry can be
         # scheduled instead of blind polling. A reviewer infra outage must not
         # blind the operator to when it clears.
@@ -330,7 +305,7 @@ def _local_status_payload() -> dict:
             "primary_status": primary["status"],
             "fallback": "preapproved_infra_only" if fallbacks else "fail",
             "fallback_workers": fallbacks,
-            "budget": primary["budget"],
+            "usage": primary["usage"],
             "retry_after_seconds": soonest,
         }
     return {
@@ -343,7 +318,7 @@ def _local_status_payload() -> dict:
         "primary_status": primary["status"],
         "fallback": "preapproved_infra_only" if fallbacks else "fail",
         "fallback_workers": fallbacks,
-        "budget": primary["budget"],
+        "usage": primary["usage"],
     }
 
 

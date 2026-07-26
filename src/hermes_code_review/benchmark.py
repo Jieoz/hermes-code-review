@@ -76,12 +76,10 @@ def run_benchmark(cases: list[dict[str, Any]], reviewer: str, worker: dict[str, 
         raise ValueError('benchmark route is not the fixed approved reviewer')
     core.worker_snapshot(reviewer, worker)
     core.policy.check_privacy([str(case['file']) for case in cases], source, acceptance, evidence)
-    runner_kwargs.setdefault('budget_path', core.BUDGET)
+    runner_kwargs.setdefault('usage_path', core.USAGE_LEDGER)
     runner_kwargs.setdefault('max_input_tokens', 120_000)
-    runner_kwargs.setdefault('daily_input_tokens', 1_000_000)
     runner_kwargs.setdefault('max_output_tokens', 4_096)
-    runner_kwargs.setdefault('daily_output_tokens', 100_000)
-    for key in ('max_input_tokens', 'daily_input_tokens', 'max_output_tokens', 'daily_output_tokens'):
+    for key in ('max_input_tokens', 'max_output_tokens'):
         if int(runner_kwargs[key]) <= 0:
             raise ValueError(f'{key} must be positive')
     call = runner or core.run_review

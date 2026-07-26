@@ -66,3 +66,9 @@ def test_metrics_event_is_minimal_and_redacted(tmp_path):
     assert event['error_class'] == 'HTTP_5XX'
     assert 'secret.example' not in json.dumps(event)
     assert 'topsecret' not in json.dumps(event)
+
+
+def test_usage_accounting_failures_have_a_stable_error_class():
+    from hermes_code_review.observability import classify_error
+    assert classify_error('unsafe usage ledger') == 'USAGE_LEDGER'
+    assert classify_error('unknown or expired usage reservation') == 'USAGE_LEDGER'

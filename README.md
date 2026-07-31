@@ -6,7 +6,7 @@ Fail-closed independent code review for immutable staged Git candidates in [Herm
 
 - Reviews exactly `HEAD + INDEX_TREE`; a changed HEAD or index produces `STALE`.
 - Rejects tracked unstaged files and non-ignored untracked files.
-- Automatically selects reviewers from enabled `main_token_reserve.workers`, restricted to supported model/transport identities; the active reserve chat route's actual model family is excluded and at most one route per reviewer model family is selected.
+- Automatically selects reviewers from enabled `main_token_reserve.workers`, restricted to supported model/transport identities; the active reserve chat route's actual model family is excluded. Every other eligible reserve joins the fallback chain, so adding a reserve makes it a reviewer with no extra opt-in. Cross-family routes are tried first (independent judgement), then same-family routes as deeper fallbacks (endpoint redundancy).
 - Never shops for a PASS: a valid `BLOCKED` verdict is final and cannot trigger fallback.
 - Blocks sensitive paths and secret-like material before any remote request.
 - Records reviewer usage for observability but never imposes a local daily quota; provider/account limits remain authoritative.

@@ -68,11 +68,18 @@ def _routes() -> tuple[list[tuple[str, dict[str, Any], dict[str, Any]]], dict[st
         raise RuntimeError("main_token_reserve.workers must contain reviewer candidates")
     author_families = _author_families(cfg, settings)
 
-    # The reserve inventory is the single reviewer-pool authority. Select at most
-    # one route per cognitive model family; duplicate endpoints are redundancy,
-    # not independent judgement. Inventory order is stable review intent; mutable
-    # circuit state must never rewrite the frozen pool identity mid-request.
-    selected: dict[str, tuple[str, dict[str, Any], dict[str, Any]]] = {}
+    # The reserve inventory is the single reviewer-pool authority: EVERY enabled,
+    # author-independent, contract-valid reserve is a reachable reviewer, so a
+    # newly added reserve participates without being enabled by hand. Ordering
+    # puts one route per cognitive model family first — independent judgement
+    # before mere endpoint redundancy — then appends the remaining same-family
+    # routes as deeper fallbacks. Inventory order is stable review intent; mutable
+    # circuit state must never rewrite the frozen pool identity mid-request, so
+    # availability is resolved by the request-time fallback walk, not by pruning
+    # candidates here.
+    diverse: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    redundant: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+    seen_families: set[str] = set()
     for name, worker in workers.items():
         if not isinstance(name, str) or not name or not isinstance(worker, dict):
             continue
@@ -89,10 +96,13 @@ def _routes() -> tuple[list[tuple[str, dict[str, Any], dict[str, Any]]], dict[st
         except (OSError, RuntimeError, ValueError):
             continue
         candidate = (name, worker, snapshot)
-        if family not in selected:
-            selected[family] = candidate
+        if family in seen_families:
+            redundant.append(candidate)
+            continue
+        seen_families.add(family)
+        diverse.append(candidate)
 
-    routes = list(selected.values())
+    routes = diverse + redundant
     if not routes:
         raise RuntimeError("reserve pool has no eligible independent reviewer model")
     return routes, cfg

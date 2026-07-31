@@ -41,10 +41,15 @@ local model/transport allowlist. Disabled/unsupported entries and every route in
 the active reserve route's model family are skipped. Thus GPT-authored candidates
 may use Opus, while Claude-authored candidates cannot. A legacy
 `author_model_families` list is used only when no active route can be resolved.
-The first eligible route per reviewer family
-enters the chain; mutable circuit state never changes that frozen identity.
-Provider diversity without cognitive model diversity is infrastructure redundancy,
-not independent judgement.
+Every remaining eligible route enters the chain, so a newly added reserve
+participates automatically without being enabled by hand. Ordering encodes
+preference, not exclusion: the first route of each reviewer family comes first,
+then the remaining same-family routes follow as deeper fallbacks. Provider
+diversity without cognitive model diversity is infrastructure redundancy rather
+than independent judgement, so it is ranked lower — but it is still reachable
+when the preferred routes are unavailable. Mutable circuit state never changes
+that frozen chain identity; availability is resolved by the request-time fallback
+walk, not by pruning candidates during selection.
 Fallback is permitted only after a remote reviewer attempt fails (any HTTP
 rejection, transport/timeout/circuit failure, or one exhausted same-route
 invalid-verdict retry). Exact HTTP 4xx classes remain observable, while the next

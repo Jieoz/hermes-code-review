@@ -216,7 +216,7 @@ def test_review_tool_refuses_fallback_when_candidate_changes_between_routes(monk
     assert value == {'status': 'CANDIDATE_REJECTED', 'error_class': 'STALE'}
 
 
-def test_review_routes_auto_select_enabled_unique_non_author_families(monkeypatch):
+def test_review_routes_auto_select_every_enabled_non_author_reserve(monkeypatch):
     from hermes_code_review import plugin
     workers = {
         'gpt-primary': configured_worker() | {'model': 'gpt-5.6-sol'},
@@ -230,7 +230,33 @@ def test_review_routes_auto_select_enabled_unique_non_author_families(monkeypatc
         'code_review': {'author_model_families': ['gpt', 'claude']},
     })
     routes, _ = plugin._routes()
-    assert [name for name, _worker, _snapshot in routes] == ['grok-a', 'kimi']
+    # Cross-family independence first, then same-family endpoint redundancy as
+    # deeper fallbacks. A newly added same-family reserve must still be reachable
+    # rather than silently dropped; only explicitly disabled routes are excluded.
+    assert [name for name, _worker, _snapshot in routes] == [
+        'grok-a', 'kimi', 'grok-b',
+    ]
+
+
+def test_review_routes_keep_same_family_reserve_as_deeper_fallback(monkeypatch):
+    from hermes_code_review import plugin
+    workers = {
+        'grok': configured_worker(),
+        'gpt-first': configured_worker() | {
+            'model': 'gpt-5.6-sol', 'base_url': 'https://gpt-one.example/v1',
+        },
+        'gpt-added-later': configured_worker() | {
+            'model': 'gpt-5.6-sol', 'base_url': 'https://gpt-two.example/v1',
+        },
+    }
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
+        'main_token_reserve': {'workers': workers},
+        'code_review': {'author_model_families': ['claude']},
+    })
+    routes, _ = plugin._routes()
+    names = [name for name, _worker, _snapshot in routes]
+    assert names == ['grok', 'gpt-first', 'gpt-added-later']
+    assert len({snapshot['route_sha'] for _n, _w, snapshot in routes}) == 3
 
 
 def test_review_routes_use_reserve_inventory_not_legacy_static_list(monkeypatch):
@@ -363,7 +389,7 @@ def test_current_pool_identity_does_not_change_when_circuit_state_changes(monkey
     monkeypatch.setattr(plugin.core, 'load_config', lambda: config)
     routes, _ = plugin._routes()
     expected = plugin._pool_identity(routes)
-    assert [name for name, _worker, _snapshot in routes] == ['grok-a', 'kimi']
+    assert [name for name, _worker, _snapshot in routes] == ['grok-a', 'kimi', 'grok-b']
 
     primary = core.worker_snapshot('grok-a', workers['grok-a'])
     core.record_failure(plugin.core.STATE, primary['route_sha'], threshold=1, cooldown=300, now=100)

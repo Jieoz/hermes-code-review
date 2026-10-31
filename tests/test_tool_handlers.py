@@ -19,7 +19,7 @@ def configured_worker():
     return {
         'provider': 'custom', 'base_url': 'https://review.example/v1',
         'api_key': 'secret', 'model': 'grok-4.5', 'api_mode': 'chat_completions',
-        'enabled': True,
+        'enabled': True, 'reviewer': True,
     }
 
 
@@ -27,7 +27,7 @@ def configured_fallback_worker():
     return {
         'provider': 'custom', 'base_url': 'https://fallback.example/v1',
         'api_key': 'fallback-secret', 'model': 'claude-opus-5',
-        'api_mode': 'anthropic_messages', 'enabled': True,
+        'api_mode': 'anthropic_messages', 'enabled': True, 'reviewer': True,
     }
 
 
@@ -35,7 +35,7 @@ def configured_kimi_worker():
     return {
         'provider': 'custom', 'base_url': 'https://kimi.example/v1',
         'api_key': 'kimi-secret', 'model': 'kimi-k3',
-        'api_mode': 'chat_completions', 'enabled': True,
+        'api_mode': 'chat_completions', 'enabled': True, 'reviewer': True,
     }
 
 
@@ -572,7 +572,7 @@ def test_status_tool_is_non_secret(monkeypatch, tmp_path):
     assert value['status'] == 'READY'
     assert value['worker'] == 'hybgzs_grok45' and value['model'] == 'grok-4.5'
     assert value['version'] == __version__
-    assert value['selection'] == 'reserve_pool_auto'
+    assert value['selection'] == 'reviewer_tag'
     assert value['author_families'] == ['gpt']
     assert value['reviewer_families'] == ['grok']
     assert value['usage'] == {

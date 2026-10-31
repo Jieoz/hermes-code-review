@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from . import policy, signing
+from . import direct_ledger, policy, signing
 
 HERMES_HOME = Path(os.environ.get('HERMES_HOME', '/opt/data')).resolve()
 CONFIG = HERMES_HOME / 'config.yaml'
@@ -35,23 +35,34 @@ RESERVE_KEY_DIR = HERMES_HOME / 'secrets/reserve_keys'
 APPROVED_WORKER = 'hybgzs_grok45'
 APPROVED_MODEL = 'grok-4.5'
 APPROVED_API_MODE = 'chat_completions'
-APPROVED_REVIEWER_IDENTITIES = {
-    ('gpt-5.6-sol', 'chat_completions'),
-    ('claude-opus-5', 'anthropic_messages'),
-    ('grok-4.5', 'chat_completions'),
-    ('kimi-k3', 'chat_completions'),
-    ('gemini-3.8-flash-high', 'chat_completions'),
+# Reviewer identity is approved per model FAMILY and wire, not per exact model
+# string: a new version of an approved family (gemini-3.8 -> gemini-3.9) must
+# not need a code change. Unknown families and unlisted wires stay rejected.
+APPROVED_FAMILY_API_MODES = {
+    'gpt': frozenset({'chat_completions'}),
+    'claude': frozenset({'anthropic_messages'}),
+    'grok': frozenset({'chat_completions'}),
+    'kimi': frozenset({'chat_completions'}),
+    'gemini': frozenset({'chat_completions'}),
 }
 
 
 def model_family(model: str) -> str:
     """Return the explicit cognitive model family used for independence checks."""
     value = str(model or '').strip().lower()
-    for family in ('gpt', 'claude', 'grok', 'kimi', 'gemini'):
+    for family in APPROVED_FAMILY_API_MODES:
         if value.startswith(family + '-') or value == family:
             return family
     raise ValueError(f'unsupported reviewer model family: {model}')
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+
+
+def is_approved_identity(model: str, mode: str) -> bool:
+    try:
+        family = model_family(model)
+    except ValueError:
+        return False
+    return mode in APPROVED_FAMILY_API_MODES[family]
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -119,7 +130,7 @@ def _is_internal_service_host(host: str) -> bool:
 def worker_snapshot(name: str, worker: dict) -> dict:
     model = str(worker.get('model') or '')
     mode = str(worker.get('api_mode') or 'chat_completions')
-    if (model, mode) not in APPROVED_REVIEWER_IDENTITIES:
+    if not is_approved_identity(model, mode):
         raise ValueError('review route does not match the approved reviewer identity')
     if not _valid_worker(name, worker):
         raise ValueError(f'invalid or disabled review worker: {name}')
@@ -419,11 +430,30 @@ def _request_json(snapshot: dict, body: dict, timeout: int) -> dict:
                                  headers=headers, method='POST')
     deadline = time.monotonic() + max(1, int(timeout))
     context = ssl.create_default_context() if snapshot['endpoint'].startswith('https:') else None
+    started = time.monotonic()
+    trace = {'status': None, 'request_id': '', 'usage': None, 'error': ''}
+    try:
+        value = _request_json_inner(req, snapshot, timeout, deadline, context, trace)
+        trace['usage'] = value.get('usage') if isinstance(value, dict) else None
+        return value
+    except Exception as exc:
+        trace['error'] = type(exc).__name__ + (': ' + str(exc)[:100] if not isinstance(exc, ReviewHTTPError) else ': ' + str(exc))
+        raise
+    finally:
+        direct_ledger.record(worker=snapshot.get('name', ''), url=snapshot['endpoint'],
+                             model=snapshot.get('model', ''), status=trace['status'], usage=trace['usage'],
+                             elapsed_ms=(time.monotonic() - started) * 1000,
+                             request_id=trace['request_id'], error=trace['error'])
+
+
+def _request_json_inner(req, snapshot: dict, timeout: int, deadline: float, context, trace: dict) -> dict:
     try:
         # Leaving this context closes the socket on success, error, or deadline,
         # which is what makes the relay stop generating.
         with urllib.request.urlopen(req, timeout=max(1, int(timeout)), context=context) as resp:
             status = int(getattr(resp, 'status', 200))
+            trace['status'] = status
+            trace['request_id'] = direct_ledger.request_id_from(getattr(resp, 'headers', None) or {})
             if not 200 <= status <= 299:
                 resp.close()
                 raise ReviewHTTPError(status, '')
@@ -439,6 +469,8 @@ def _request_json(snapshot: dict, body: dict, timeout: int) -> dict:
                 return value
             return _assemble_stream(resp, snapshot['api_mode'], deadline)
     except urllib.error.HTTPError as exc:
+        trace['status'] = exc.code
+        trace['request_id'] = direct_ledger.request_id_from(getattr(exc, 'headers', None) or {})
         exc.close()
         raise ReviewHTTPError(exc.code, '') from None
 

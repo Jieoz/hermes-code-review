@@ -8,7 +8,7 @@ from hermes_code_review import core, plugin
 
 def worker(**extra):
     return {'provider': 'custom', 'base_url': 'https://review.example/v1', 'api_key': 'secret',
-            'model': 'gemini-3.8-flash-high', 'api_mode': 'chat_completions', 'enabled': True, **extra}
+            'model': 'gemini-3.8-flash-high', 'api_mode': 'chat_completions', 'enabled': True, 'reviewer': True, **extra}
 
 
 def receipt():
@@ -136,35 +136,101 @@ def test_connection_refused_still_retries(tmp_path):
     assert calls['n'] == 2
 
 
-def test_pinned_reviewer_workers_is_the_whole_pool(monkeypatch):
+def _cfg(workers, families=('gpt',)):
+    return {'main_token_reserve': {'workers': workers},
+            'code_review': {'author_model_families': list(families)}}
+
+
+def test_only_reviewer_tagged_workers_join_the_pool(monkeypatch):
     workers = {
-        'oojj_opus5': worker(model='claude-opus-5', api_mode='anthropic_messages'),
+        'oojj_opus5': worker(model='claude-opus-5', api_mode='anthropic_messages', reviewer=False),
         'flash': worker(base_url='http://cli-proxy-api:8317/v1'),
-        'grok': worker(model='grok-4.5'),
+        'grok': worker(model='grok-4.5', reviewer=None),
     }
-    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
-        'main_token_reserve': {'workers': workers},
-        'code_review': {'author_model_families': ['gpt'], 'reviewer_workers': ['flash']},
-    })
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: _cfg(workers))
     routes, _ = plugin._routes()
     assert [name for name, _w, _s in routes] == ['flash']
 
 
-def test_pinned_reviewer_still_enforces_independence(monkeypatch):
-    workers = {'flash': worker()}
-    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
-        'main_token_reserve': {'workers': workers},
-        'code_review': {'author_model_families': ['gemini'], 'reviewer_workers': ['flash']},
-    })
+def test_no_tagged_worker_fails_closed_with_actionable_message(monkeypatch):
+    workers = {'grok': worker(model='grok-4.5', reviewer=False)}
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: _cfg(workers))
+    with pytest.raises(RuntimeError, match='reviewer: true'):
+        plugin._routes()
+
+
+def test_removed_tagged_worker_fails_closed_never_spills(monkeypatch):
+    # Reviewer reserve deleted: expensive untagged reserves must NOT take over.
+    workers = {'opus': worker(model='claude-opus-5', api_mode='anthropic_messages', reviewer=False),
+               'grok': worker(model='grok-4.5', reviewer=False)}
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: _cfg(workers))
     with pytest.raises(RuntimeError, match='no eligible'):
         plugin._routes()
 
 
-def test_unpinned_pool_unchanged(monkeypatch):
-    workers = {'grok': worker(model='grok-4.5'), 'flash': worker()}
-    monkeypatch.setattr(plugin.core, 'load_config', lambda: {
-        'main_token_reserve': {'workers': workers},
-        'code_review': {'author_model_families': ['gpt']},
-    })
+def test_tagged_reviewer_still_enforces_independence(monkeypatch):
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: _cfg({'flash': worker()}, ('gemini',)))
+    with pytest.raises(RuntimeError, match='shares the author'):
+        plugin._routes()
+
+
+def test_tagged_disabled_worker_is_skipped(monkeypatch):
+    workers = {'flash': worker(enabled=False), 'grok': worker(model='grok-4.5')}
+    monkeypatch.setattr(plugin.core, 'load_config', lambda: _cfg(workers))
     routes, _ = plugin._routes()
-    assert [name for name, _w, _s in routes] == ['grok', 'flash']
+    assert [name for name, _w, _s in routes] == ['grok']
+
+
+@pytest.mark.parametrize('model', ['gemini-3.9-flash', 'gemini-4-pro', 'gemini-3.8-flash-high'])
+def test_new_versions_of_approved_family_need_no_code_change(model):
+    snap = core.worker_snapshot('g', worker(model=model))
+    assert snap['model'] == model
+
+
+@pytest.mark.parametrize('model,mode', [
+    ('llama-5', 'chat_completions'),            # unknown family
+    ('gemini-3.9-flash', 'anthropic_messages'),  # family on an unapproved wire
+    ('claude-opus-6', 'chat_completions'),
+])
+def test_unknown_family_or_wire_still_rejected(model, mode):
+    with pytest.raises(ValueError, match='approved reviewer'):
+        core.worker_snapshot('g', worker(model=model, api_mode=mode))
+
+
+def test_every_review_api_call_lands_in_direct_ledger(monkeypatch, _isolated_direct_ledger):
+    class Resp:
+        status = 200
+        headers = {'Content-Type': 'text/event-stream', 'x-oneapi-request-id': 'rid-123'}
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"ok"}}]}\n'
+            yield b'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2}}\n'
+            yield b'data: [DONE]\n'
+        def read(self, *_a):
+            return b''
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    monkeypatch.setattr(core.urllib.request, 'urlopen', lambda *a, **k: Resp())
+    snap = core.worker_snapshot('flash', worker())
+    core._request_json(snap, {'model': 'm', 'messages': []}, 30)
+    rows = [json.loads(l) for l in _isolated_direct_ledger.read_text().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row['caller'] == 'code_review' and row['worker'] == 'flash'
+    assert row['status'] == 200 and row['in'] == 11 and row['out'] == 2
+    assert row['request_id'] == 'rid-123' and row['host'] == 'review.example'
+    assert 'secret' not in _isolated_direct_ledger.read_text()
+
+
+def test_failed_review_call_is_still_ledgered(monkeypatch, _isolated_direct_ledger):
+    def boom(*a, **k):
+        raise core.urllib.error.HTTPError('https://review.example/v1', 503, 'x', {'x-request-id': 'r9'}, None)
+    monkeypatch.setattr(core.urllib.request, 'urlopen', boom)
+    snap = core.worker_snapshot('flash', worker())
+    with pytest.raises(core.ReviewHTTPError):
+        core._request_json(snap, {'model': 'm', 'messages': []}, 30)
+    row = json.loads(_isolated_direct_ledger.read_text().splitlines()[-1])
+    assert row['status'] == 503 and row['request_id'] == 'r9' and 'HTTP 503' in row['error']

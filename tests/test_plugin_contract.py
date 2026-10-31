@@ -85,6 +85,7 @@ main_token_reserve:
   workers:
     hybgzs_grok45:
       enabled: true
+      reviewer: true
       base_url: https://review.example/v1
       api_key_env: REVIEW_TEST_KEY
       model: grok-4.5

@@ -12,7 +12,7 @@ METRICS = core.HERMES_HOME / "state/code_review_metrics.jsonl"
 
 REVIEW_SCHEMA = {
     "name": "review_git_candidate",
-    "description": "On-demand only: call before a release/tag, a GitHub push, or when the user explicitly asks for review; do not call for routine edits. Reviews the immutable staged Git candidate with an independent reviewer (code_review.reviewer_workers pins it, else auto-selected from the reserve pool). Fails closed on drift, infrastructure errors, secrets, or invalid verdicts.",
+    "description": "On-demand only: call before a release/tag, a GitHub push, or when the user explicitly asks for review; do not call for routine edits. Reviews the immutable staged Git candidate with an independent reviewer (reserve workers tagged `reviewer: true`). Fails closed on drift, infrastructure errors, secrets, or invalid verdicts.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -67,17 +67,19 @@ def _routes() -> tuple[list[tuple[str, dict[str, Any], dict[str, Any]]], dict[st
     if not isinstance(workers, dict) or not workers:
         raise RuntimeError("main_token_reserve.workers must contain reviewer candidates")
     author_families = _author_families(cfg, settings)
-    pinned = settings.get("reviewer_workers")
-    if pinned is not None:
-        if not isinstance(pinned, list) or not all(isinstance(n, str) and n for n in pinned):
-            raise RuntimeError("code_review.reviewer_workers must be a list of reserve worker names")
-        # An explicit pin is the whole pool: never spill over to other (possibly
-        # expensive) reserves. Independence is still enforced per route.
-        workers = {name: workers[name] for name in pinned if name in workers}
+    # Only reserves explicitly tagged `reviewer: true` may review. The old
+    # behaviour (every enabled reserve joins) silently sent 120k-token reviews
+    # to expensive routes. The tag lives on the worker, so replacing the model
+    # means moving one flag, and a removed worker cannot be referenced stale.
+    tagged = {name: w for name, w in workers.items() if isinstance(w, dict) and w.get("reviewer") is True}
+    if not tagged:
+        raise RuntimeError(
+            "reserve pool has no eligible independent reviewer model: "
+            "no main_token_reserve worker is tagged `reviewer: true`"
+        )
+    workers = tagged
 
-    # The reserve inventory is the single reviewer-pool authority: EVERY enabled,
-    # author-independent, contract-valid reserve is a reachable reviewer, so a
-    # newly added reserve participates without being enabled by hand. Ordering
+    # Among tagged workers: skip disabled / author-family / invalid ones. Ordering
     # puts one route per cognitive model family first — independent judgement
     # before mere endpoint redundancy — then appends the remaining same-family
     # routes as deeper fallbacks. Inventory order is stable review intent; mutable
@@ -111,7 +113,11 @@ def _routes() -> tuple[list[tuple[str, dict[str, Any], dict[str, Any]]], dict[st
 
     routes = diverse + redundant
     if not routes:
-        raise RuntimeError("reserve pool has no eligible independent reviewer model")
+        raise RuntimeError(
+            "reserve pool has no eligible independent reviewer model: every `reviewer: true` "
+            "worker is disabled, invalid, or shares the author's model family "
+            f"({', '.join(sorted(author_families))})"
+        )
     return routes, cfg
 
 
@@ -353,7 +359,7 @@ def _local_status_payload() -> dict:
         return {
             "status": "ALL_ROUTES_UNAVAILABLE",
             "version": __version__,
-            "selection": "reserve_pool_auto",
+            "selection": "reviewer_tag",
             "author_families": author_families,
             "reviewer_families": [core.model_family(row["model"]) for row in route_rows],
             "worker": primary["worker"],
@@ -369,7 +375,7 @@ def _local_status_payload() -> dict:
     return {
         "status": "READY",
         "version": __version__,
-        "selection": "reserve_pool_auto",
+        "selection": "reviewer_tag",
         "author_families": author_families,
         "reviewer_families": [core.model_family(row["model"]) for row in route_rows],
         "worker": primary["worker"],

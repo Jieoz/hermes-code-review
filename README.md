@@ -62,10 +62,17 @@ test/build/static gates
 
 ## Configuration
 
-The reviewer pool is derived automatically from `main_token_reserve.workers` on
-every invocation. The active `main_token_reserve.route.chat` (or `route.default`)
-worker is the author-family authority, so a GPT-authored candidate may use Opus
-while a Claude-authored candidate may not. Disabled workers, `review_disabled: true`,
+Only `main_token_reserve.workers` entries tagged `reviewer: true` may review.
+Untagged reserves never receive review traffic, so an expensive route cannot be
+picked up by accident. To change the reviewer, move the tag to another worker; no
+code change or restart-time list is needed. When no tagged worker is eligible the
+tool fails closed with a message naming the missing tag; it never spills over to
+other reserves. `switch_worker.py` keeps the tag when it rebuilds the same slot
+with the same model and drops it when the slot changes model.
+
+The active `main_token_reserve.route.chat` (or `route.default`) worker is the
+author-family authority, so a GPT-authored candidate may use Opus while a
+Claude-authored candidate may not. Disabled workers, `review_disabled: true`,
 unsupported identities, and the active author family are skipped. Inventory order defines stable
 family priority; when duplicate routes serve the same model family, only the first
 eligible family representative enters the review chain. Circuit state is reported
@@ -76,6 +83,7 @@ main_token_reserve:
   workers:
     grok_review:
       enabled: true
+      reviewer: true
       provider: custom
       model: grok-4.5
       base_url: https://primary-review.example/v1
@@ -83,6 +91,7 @@ main_token_reserve:
       api_key_file: /opt/data/secrets/reserve_keys/grok_review
     kimi_review:
       enabled: true
+      reviewer: true
       provider: custom
       model: kimi-k3
       base_url: https://fallback-review.example/v1
@@ -92,7 +101,7 @@ main_token_reserve:
 code_review:
   # Legacy fail-closed fallback only when no active reserve route can be resolved:
   author_model_families: [gpt, claude]
-  max_input_tokens: 120000
+  max_input_tokens: 40000
   max_output_tokens: 8192
 ```
 
@@ -127,9 +136,10 @@ They are per-request technical bounds, not daily quotas. The local usage ledger 
 it accounts for primary and fallback traffic but never blocks a normal review.
 Provider/account quotas remain the single authority for aggregate consumption.
 
-Approved identities are currently `gpt-5.6-sol/chat_completions`,
-`claude-opus-5/anthropic_messages`, `grok-4.5/chat_completions`, and
-`kimi-k3/chat_completions`. Reserve inventory membership is the routing source;
+Approved identities are per model family and wire, so a new version of an approved
+family (for example `gemini-3.8-flash` -> `gemini-3.9-flash`) needs no code change:
+`gpt`, `grok`, `kimi`, `gemini` on `chat_completions`, and `claude` on
+`anthropic_messages`. Unknown families and unlisted wires are rejected. The tag is the routing source;
 identity support only determines which enabled entries are eligible. The mandatory
 active-author-family exclusion and reviewer-family deduplication decide which
 identities may actually sign in one deployment. `author_model_families` is consulted
@@ -137,6 +147,12 @@ only as a fail-closed compatibility fallback when no active reserve route exists
 `code_review.workers` and
 `fallback_workers` are obsolete and ignored.
 Credential files must be regular files under `/opt/data/secrets/reserve_keys` with mode `0600`. Credentials, base URLs, and authorization headers are excluded from receipts and metrics.
+
+Every review API call (success or failure) is appended to Hermes' unified
+direct-API ledger `/opt/data/logs/direct_api_calls.jsonl` (override with
+`HERMES_DIRECT_API_LEDGER`): time, worker, host, model, status, tokens, elapsed
+time, and the upstream request id when the relay returns one. Keys, bodies, and
+query strings are never written. Ledger failures never affect a review.
 
 ## CLI
 

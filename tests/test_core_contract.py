@@ -52,11 +52,9 @@ def test_route_fingerprint_excludes_credentials():
 
 def test_every_approved_reviewer_has_a_recognized_model_family():
     from hermes_code_review import core
-    unknown = {
-        model for model, _api_mode in core.APPROVED_REVIEWER_IDENTITIES
-        if core.model_family(model) is None
-    }
-    assert unknown == set()
+    for family, modes in core.APPROVED_FAMILY_API_MODES.items():
+        assert core.model_family(family + '-x') == family
+        assert modes
 
 
 def test_keyfile_must_be_0600_and_under_allowed_dir(tmp_path, monkeypatch):

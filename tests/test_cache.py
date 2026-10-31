@@ -146,8 +146,8 @@ def test_concurrent_change_cannot_change_outbound_frozen_source_and_makes_result
 
     def transport(route, body, timeout):
         prompt = body['messages'][-1]['content']
-        assert base64.b64encode(expected['diff']).decode() in prompt
-        assert base64.b64encode(changed['diff']).decode() not in prompt
+        assert expected['diff'].decode() in prompt
+        assert changed['diff'].decode() not in prompt
         verdict = {
             'passed': True, 'safe_to_commit': True, 'summary': 'clean',
             'p0': [], 'p1': [], 'p2': [], 'security_concerns': [],

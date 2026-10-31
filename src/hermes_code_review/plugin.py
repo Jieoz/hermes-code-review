@@ -12,7 +12,7 @@ METRICS = core.HERMES_HOME / "state/code_review_metrics.jsonl"
 
 REVIEW_SCHEMA = {
     "name": "review_git_candidate",
-    "description": "Review the immutable staged Git candidate with an independent model selected automatically from the reserve pool. Fails closed on drift, infrastructure errors, secrets, or invalid verdicts.",
+    "description": "On-demand only: call before a release/tag, a GitHub push, or when the user explicitly asks for review; do not call for routine edits. Reviews the immutable staged Git candidate with an independent reviewer (code_review.reviewer_workers pins it, else auto-selected from the reserve pool). Fails closed on drift, infrastructure errors, secrets, or invalid verdicts.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -67,6 +67,13 @@ def _routes() -> tuple[list[tuple[str, dict[str, Any], dict[str, Any]]], dict[st
     if not isinstance(workers, dict) or not workers:
         raise RuntimeError("main_token_reserve.workers must contain reviewer candidates")
     author_families = _author_families(cfg, settings)
+    pinned = settings.get("reviewer_workers")
+    if pinned is not None:
+        if not isinstance(pinned, list) or not all(isinstance(n, str) and n for n in pinned):
+            raise RuntimeError("code_review.reviewer_workers must be a list of reserve worker names")
+        # An explicit pin is the whole pool: never spill over to other (possibly
+        # expensive) reserves. Independence is still enforced per route.
+        workers = {name: workers[name] for name in pinned if name in workers}
 
     # The reserve inventory is the single reviewer-pool authority: EVERY enabled,
     # author-independent, contract-valid reserve is a reachable reviewer, so a
@@ -233,7 +240,7 @@ def review_git_candidate(args: dict, **_: Any) -> str:
                     worker,
                     requirements=str(args.get("requirements") or ""),
                     evidence=str(args.get("evidence") or ""),
-                    attempts=2,
+                    attempts=1,
                     timeout=max(1, min(int(args.get("timeout") or 240), 600)),
                     current_worker=lambda route_name=name: _current_pool_worker(expected_pool, route_name),
                     usage_path=core.USAGE_LEDGER,
